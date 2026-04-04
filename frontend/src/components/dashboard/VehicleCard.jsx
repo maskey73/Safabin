@@ -4,9 +4,9 @@ const VehicleCard = ({ vehicle }) => {
   const statusTone = {
     Collected: {
       bg: "bg-[#f2f7ee]",
-      border: "border-[var(--accent)]/25",
-      text: "text-[var(--accent)]",
-      dot: "bg-[var(--accent)]",
+      border: "border-accent/25",
+      text: "text-accent",
+      dot: "bg-accent",
     },
     "In Transit": {
       bg: "bg-blue-50",
@@ -17,7 +17,7 @@ const VehicleCard = ({ vehicle }) => {
     Idle: {
       bg: "bg-black/5",
       border: "border-black/10",
-      text: "text-[var(--primary)]/70",
+      text: "text-primary/70",
       dot: "bg-black/30",
     },
     Maintenance: {
@@ -43,7 +43,7 @@ const VehicleCard = ({ vehicle }) => {
       ? "bg-red-500"
       : fillPercentage >= 70
       ? "bg-orange-500"
-      : "bg-[var(--accent)]";
+      : "bg-accent";
 
   const typeLabel =
     vehicle.type === "NON_BIO" ? "Non-bio" : vehicle.type === "BIO" ? "Bio" : String(vehicle.type);
@@ -56,15 +56,15 @@ const VehicleCard = ({ vehicle }) => {
   })();
 
   return (
-    <div className="bg-white rounded-3xl border border-[var(--primary)]/15 shadow-sm hover:shadow-md transition-shadow">
+    <div className="bg-white rounded-3xl border border-primary/15 shadow-sm hover:shadow-md transition-shadow">
       <div className="p-5">
         {/* Top row */}
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
-            <h4 className="font-bold text-lg text-[var(--primary)] truncate">
+            <h4 className="font-bold text-lg text-primary truncate">
               {vehicle.licensePlate}
             </h4>
-            <p className="text-sm text-[var(--primary)]/65">
+            <p className="text-sm text-primary/65">
               {typeLabel} truck
             </p>
           </div>
@@ -84,12 +84,12 @@ const VehicleCard = ({ vehicle }) => {
         </div>
 
         {/* Load */}
-        <div className="mt-5 pt-4 border-t border-[var(--primary)]/10">
+        <div className="mt-5 pt-4 border-t border-primary/10">
           <div className="flex items-center justify-between text-xs">
-            <span className="text-[var(--primary)]/60 font-semibold">
+            <span className="text-primary/60 font-semibold">
               Load
             </span>
-            <span className="text-[var(--primary)] font-semibold">
+            <span className="text-primary font-semibold">
               {fillPercentage}% • {loadText}
             </span>
           </div>
@@ -101,7 +101,7 @@ const VehicleCard = ({ vehicle }) => {
             />
           </div>
 
-          <p className="mt-2 text-xs text-[var(--primary)]/60">
+          <p className="mt-2 text-xs text-primary/60">
             {fillPercentage >= 90
               ? "Critical: near full capacity"
               : fillPercentage >= 70
@@ -116,9 +116,9 @@ const VehicleCard = ({ vehicle }) => {
 
 function Row({ icon, value, strong }) {
   return (
-    <div className="flex items-start gap-2 text-sm text-[var(--primary)]/70">
+    <div className="flex items-start gap-2 text-sm text-primary/70">
       <span className="mt-0.5">{icon}</span>
-      <span className={`min-w-0 ${strong ? "font-semibold text-[var(--primary)]" : ""} truncate`}>
+      <span className={`min-w-0 ${strong ? "font-semibold text-primary" : ""} truncate`}>
         {value || "—"}
       </span>
     </div>
