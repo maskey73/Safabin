@@ -1,14 +1,15 @@
 import MLSchedule from "../models/MLSchedule.model.js";
 import Truck from "../models/Truck.model.js";
 import Driver from "../models/Driver.model.js";
-import District from "../models/District.model.js";
+import Area from "../models/Area.model.js";
 import User from "../models/User.model.js";
 import {
-  predictDistrict as mlPredict,
+  predictArea as mlPredict,
   generateSchedule as mlGenerate,
   checkMLHealth as mlHealth,
 } from "../services/mlClient.js";
 import { createSystemNotification } from "./notification.controller.js";
+import { getIO } from "../socket/socketServer.js";
 
 /**
  * Get today's local date as a UTC midnight Date.
@@ -24,11 +25,12 @@ function getLocalTodayUTC() {
 }
 
 /**
- * Org-aware truck assignment: assigns trucks to districts based on predicted waste,
- * ensuring trucks only go to districts within the SAME org.
- * Returns { districtsData, summary }.
+ * Org-aware truck assignment: assigns trucks to areas based on predicted waste,
+ * ensuring trucks only go to areas within the SAME org.
+ * ML service returns "district" field names which we map to "area" internally.
+ * Returns { areasData, summary }.
  */
-function assignTrucksToDistricts(mlDistricts, trucksWithDrivers, districtOrgMap, districtOrgNameMap = {}) {
+function assignTrucksToAreas(mlPredictions, trucksWithDrivers, areaOrgMap, areaOrgNameMap = {}) {
   // Build a pool of available trucks grouped by org
   const truckPoolByOrg = {};
   for (const t of trucksWithDrivers) {
@@ -37,26 +39,26 @@ function assignTrucksToDistricts(mlDistricts, trucksWithDrivers, districtOrgMap,
     truckPoolByOrg[orgKey].push({ ...t, _assigned: false });
   }
 
-  // Sort districts by predicted waste descending so high-demand districts pick first
-  const sortedDistricts = [...mlDistricts].sort(
+  // Sort areas by predicted waste descending so high-demand areas pick first
+  const sortedAreas = [...mlPredictions].sort(
     (a, b) => (b.predicted_waste_kg || 0) - (a.predicted_waste_kg || 0)
   );
 
-  const districtsData = [];
+  const areasData = [];
   const assignedTruckIds = new Set();
 
-  for (const d of sortedDistricts) {
-    const districtOrgId = districtOrgMap[d.district?.toLowerCase()] || null;
+  for (const d of sortedAreas) {
+    const areaOrgId = areaOrgMap[d.district?.toLowerCase()] || null;
     const predictedWaste = d.predicted_waste_kg || 0;
 
-    // Find available trucks from the SAME org (or any org if district has no org)
+    // Find available trucks from the SAME org (or any org if area has no org)
     let candidateTrucks;
-    if (districtOrgId) {
-      candidateTrucks = (truckPoolByOrg[districtOrgId] || []).filter(
+    if (areaOrgId) {
+      candidateTrucks = (truckPoolByOrg[areaOrgId] || []).filter(
         (t) => !assignedTruckIds.has(t.id)
       );
     } else {
-      // District has no org constraint: pick from all remaining trucks
+      // Area has no org constraint: pick from all remaining trucks
       candidateTrucks = trucksWithDrivers.filter(
         (t) => !assignedTruckIds.has(t.id)
       );
@@ -82,10 +84,10 @@ function assignTrucksToDistricts(mlDistricts, trucksWithDrivers, districtOrgMap,
       action = "skip";
       if (trucksWithDrivers.length === 0) {
         skipReason = "No trucks with assigned drivers available";
-      } else if (districtOrgId && !(truckPoolByOrg[districtOrgId]?.length)) {
-        skipReason = "No trucks available from this district's organization";
+      } else if (areaOrgId && !(truckPoolByOrg[areaOrgId]?.length)) {
+        skipReason = "No trucks available from this area's organization";
       } else {
-        skipReason = "All matching trucks already assigned to other districts";
+        skipReason = "All matching trucks already assigned to other areas";
       }
     } else if (totalCapacity >= predictedWaste) {
       action = "dispatch";
@@ -93,9 +95,9 @@ function assignTrucksToDistricts(mlDistricts, trucksWithDrivers, districtOrgMap,
       action = "reduced";
     }
 
-    districtsData.push({
-      district: d.district,
-      districtType: d.district_type,
+    areasData.push({
+      area: d.district,
+      areaType: d.district_type,
       predictedWasteKg: predictedWaste,
       wasteCategory: d.waste_category,
       action,
@@ -103,7 +105,7 @@ function assignTrucksToDistricts(mlDistricts, trucksWithDrivers, districtOrgMap,
       isHoliday: d.is_holiday,
       holidayName: d.holiday_name || null,
       skipReason,
-      orgName: districtOrgNameMap[d.district?.toLowerCase()] || null,
+      orgName: areaOrgNameMap[d.district?.toLowerCase()] || null,
       assignedTrucks: assigned.map((t) => ({
         truckId: t.id,
         licensePlate: t.license_plate,
@@ -117,41 +119,113 @@ function assignTrucksToDistricts(mlDistricts, trucksWithDrivers, districtOrgMap,
     });
   }
 
-  // Re-sort back to original order (by district name) for consistency
-  districtsData.sort((a, b) => a.district.localeCompare(b.district));
+  // === SECOND PASS: Auto-redispatch skipped/reduced areas ===
+  // Try to assign closest matching truck from ANY org (cross-org fallback)
+  // as long as the truck hasn't been assigned yet
+  const needsRedispatch = areasData.filter(
+    (d) => d.action === "skip" || d.action === "reduced"
+  );
+
+  for (const areaEntry of needsRedispatch) {
+    const remainingTrucks = trucksWithDrivers.filter(
+      (t) => !assignedTruckIds.has(t.id)
+    );
+
+    if (remainingTrucks.length === 0) break;
+
+    const neededKg = areaEntry.predictedWasteKg || 0;
+    const currentCapacity = areaEntry.assignedTrucks.reduce(
+      (sum, t) => sum + (t.capacity || 0), 0
+    );
+    const deficit = neededKg - currentCapacity;
+
+    if (deficit <= 0 && areaEntry.assignedTrucks.length > 0) continue;
+
+    // Sort by closest capacity match to the deficit (or total need if no trucks yet)
+    const targetKg = areaEntry.assignedTrucks.length > 0 ? deficit : neededKg;
+    remainingTrucks.sort((a, b) => {
+      const diffA = Math.abs((a.capacity_kg || 0) - targetKg);
+      const diffB = Math.abs((b.capacity_kg || 0) - targetKg);
+      return diffA - diffB;
+    });
+
+    // Assign trucks until we meet or exceed the predicted waste
+    let totalCap = currentCapacity;
+    const newlyAssigned = [];
+    for (const truck of remainingTrucks) {
+      if (totalCap >= neededKg && (areaEntry.assignedTrucks.length + newlyAssigned.length) > 0) break;
+      newlyAssigned.push(truck);
+      totalCap += truck.capacity_kg || 0;
+      assignedTruckIds.add(truck.id);
+    }
+
+    if (newlyAssigned.length > 0) {
+      areaEntry.assignedTrucks.push(
+        ...newlyAssigned.map((t) => ({
+          truckId: t.id,
+          licensePlate: t.license_plate,
+          driverName: t.driver_name,
+          driverId: t.driver_id,
+          capacity: t.capacity_kg,
+          truckType: t.truck_type,
+          orgId: t.org_id,
+          orgName: t.org_name,
+        }))
+      );
+
+      if (totalCap >= neededKg) {
+        areaEntry.action = "dispatch";
+        areaEntry.skipReason = null;
+        areaEntry.recommendation = `Auto-assigned closest available truck(s): ${newlyAssigned.map(t => t.license_plate).join(", ")}`;
+      } else {
+        areaEntry.action = "reduced";
+        areaEntry.skipReason = null;
+        areaEntry.recommendation = `Partially covered with ${newlyAssigned.map(t => t.license_plate).join(", ")} (${Math.round(totalCap)}/${Math.round(neededKg)} kg)`;
+      }
+    }
+  }
+
+  // Re-sort back to original order (by area name) for consistency
+  areasData.sort((a, b) => a.area.localeCompare(b.area));
 
   // Calculate summary stats from our assignment
-  const dispatched = districtsData.filter((d) => d.action === "dispatch").length;
-  const reduced = districtsData.filter((d) => d.action === "reduced").length;
-  const skipped = districtsData.filter((d) => d.action === "skip").length;
+  const dispatched = areasData.filter((d) => d.action === "dispatch").length;
+  const reduced = areasData.filter((d) => d.action === "reduced").length;
+  const skipped = areasData.filter((d) => d.action === "skip").length;
 
   const summary = {
-    totalDistricts: districtsData.length,
+    totalAreas: areasData.length,
     dispatched,
     reduced,
     skipped,
     totalTrucksAssigned: assignedTruckIds.size,
   };
 
-  return { districtsData, summary };
+  return { areasData, summary };
 }
 
 /**
- * Predict waste for a single district on a date.
+ * Predict waste for a single area on a date.
  * POST /api/ml-schedule/predict
+ * Accepts { area, date } — maps "area" to ML service's "district" param.
  */
-export const predictDistrict = async (req, res) => {
+export const predictArea = async (req, res) => {
   try {
-    const { district, date } = req.body;
+    const { area, date } = req.body;
 
-    if (!district || !date) {
+    if (!area || !date) {
       return res.status(400).json({
         success: false,
-        message: "district and date are required",
+        message: "area and date are required",
       });
     }
 
-    const result = await mlPredict(district, date);
+    // Look up the area in DB to get type and scale factor for unknown districts
+    const dbArea = await Area.findOne({ name: area, isActive: true }).lean();
+    const areaType = dbArea?.type || null;
+    const scaleFactor = dbArea?.scaleFactor || 1.0;
+
+    const result = await mlPredict(area, date, areaType, scaleFactor);
 
     if (result.fallback) {
       return res.status(503).json({
@@ -166,7 +240,7 @@ export const predictDistrict = async (req, res) => {
       data: result,
     });
   } catch (error) {
-    console.error("Predict district error:", error);
+    console.error("Predict area error:", error);
     res.status(500).json({
       success: false,
       message: "Failed to predict waste volume",
@@ -234,17 +308,27 @@ export const generateSchedule = async (req, res) => {
     const trucksWithDrivers = allTrucks.filter((t) => t.driver_id);
     const driverlessTrucksList = allTrucks.filter((t) => !t.driver_id);
 
-    // 3b. Build district→org map so we can enforce org-scoped truck assignment
-    const allDistricts = await District.find({ isActive: true }).populate("orgId", "name").lean();
-    const districtOrgMap = {};
-    const districtOrgNameMap = {};
-    for (const d of allDistricts) {
-      districtOrgMap[d.name.toLowerCase()] = d.orgId?._id?.toString() || null;
-      districtOrgNameMap[d.name.toLowerCase()] = d.orgId?.name || null;
+    // 3b. Build area→org map so we can enforce org-scoped truck assignment
+    const allAreas = await Area.find({ isActive: true }).populate("orgId", "name").lean();
+    const areaOrgMap = {};
+    const areaOrgNameMap = {};
+    for (const a of allAreas) {
+      areaOrgMap[a.name.toLowerCase()] = a.orgId?._id?.toString() || null;
+      areaOrgNameMap[a.name.toLowerCase()] = a.orgId?.name || null;
     }
 
-    // 4. Call ML service with only driver-assigned trucks
-    const result = await mlGenerate(date, trucksWithDrivers, unavailableDrivers || []);
+    // 3c. Build extra areas list — DB areas that aren't in the ML trained set
+    //     These get type-based predictions with scale factors
+    const extraAreas = allAreas
+      .filter((a) => a.type && a.name)
+      .map((a) => ({
+        name: a.name,
+        type: a.type,
+        scale_factor: a.scaleFactor || 1.0,
+      }));
+
+    // 4. Call ML service with only driver-assigned trucks + extra areas
+    const result = await mlGenerate(date, trucksWithDrivers, unavailableDrivers || [], extraAreas);
 
     if (result.fallback) {
       return res.status(503).json({
@@ -255,11 +339,11 @@ export const generateSchedule = async (req, res) => {
     }
 
     // Org-aware truck assignment: use ML predictions but assign trucks ourselves
-    const { districtsData, summary: assignmentSummary } = assignTrucksToDistricts(
+    const { areasData, summary: assignmentSummary } = assignTrucksToAreas(
       result.districts,
       trucksWithDrivers,
-      districtOrgMap,
-      districtOrgNameMap
+      areaOrgMap,
+      areaOrgNameMap
     );
 
     // 5. Save schedule to database
@@ -269,7 +353,7 @@ export const generateSchedule = async (req, res) => {
       status: "draft",
       totalPredictedWasteKg: result.summary.total_predicted_waste_kg,
       summary: {
-        totalDistricts: assignmentSummary.totalDistricts,
+        totalAreas: assignmentSummary.totalAreas,
         dispatched: assignmentSummary.dispatched,
         skipped: assignmentSummary.skipped,
         reduced: assignmentSummary.reduced,
@@ -278,7 +362,7 @@ export const generateSchedule = async (req, res) => {
         driverlessTrucks: driverlessTrucksList.length,
         unavailableDrivers: result.summary.unavailable_drivers,
       },
-      districts: districtsData,
+      areas: areasData,
       generatedBy: req.user._id,
       mlModelInfo: {
         model: "GradientBoosting",
@@ -354,13 +438,13 @@ export const generateSchedule = async (req, res) => {
       }
     }
 
-    // Create notifications for skipped districts (no truck/driver)
-    const skippedDistricts = districtsData.filter(d => d.action === "skip" && d.skipReason);
-    if (skippedDistricts.length > 0) {
+    // Create notifications for skipped areas (no truck/driver)
+    const skippedAreas = areasData.filter(d => d.action === "skip" && d.skipReason);
+    if (skippedAreas.length > 0) {
       await createSystemNotification({
         type: "schedule_failed",
-        title: "Districts Skipped Due to Resource Shortage",
-        message: `${skippedDistricts.length} district(s) were skipped on ${date}: ${skippedDistricts.map(d => `${d.district} (${d.skipReason})`).join("; ")}`,
+        title: "Areas Skipped Due to Resource Shortage",
+        message: `${skippedAreas.length} area(s) were skipped on ${date}: ${skippedAreas.map(d => `${d.area} (${d.skipReason})`).join("; ")}`,
         severity: "critical",
         targetRoles: ["super_admin"],
         relatedData: {
@@ -420,15 +504,15 @@ export const getMLSchedules = async (req, res) => {
       .limit(parseInt(limit))
       .lean();
 
-    // If org-scoped, filter districts to only those with trucks from the org
+    // If org-scoped, filter areas to only those with trucks from the org
     if (orgId) {
       schedules = schedules
         .map((schedule) => {
-          const filteredDistricts = schedule.districts.filter((d) =>
+          const filteredAreas = schedule.areas.filter((d) =>
             d.assignedTrucks.some((t) => t.orgId === orgId)
           );
-          if (filteredDistricts.length === 0) return null;
-          return { ...schedule, districts: filteredDistricts };
+          if (filteredAreas.length === 0) return null;
+          return { ...schedule, areas: filteredAreas };
         })
         .filter(Boolean);
     }
@@ -517,6 +601,62 @@ export const confirmSchedule = async (req, res) => {
     schedule.confirmedAt = new Date();
     await schedule.save();
 
+    // Notify all assigned drivers via socket AND persistent notifications
+    try {
+      const io = getIO();
+      // Collect unique Driver doc IDs and build a map of driver → assigned areas
+      const driverDocIds = new Set();
+      const driverAreaMap = {}; // driverId -> [areaName, ...]
+      for (const area of (schedule.areas || [])) {
+        for (const truck of (area.assignedTrucks || [])) {
+          if (truck.driverId) {
+            driverDocIds.add(truck.driverId);
+            if (!driverAreaMap[truck.driverId]) driverAreaMap[truck.driverId] = [];
+            driverAreaMap[truck.driverId].push(area.area);
+          }
+        }
+      }
+      // Look up User IDs from Driver documents (socket rooms use userId, not driver._id)
+      if (driverDocIds.size > 0) {
+        const drivers = await Driver.find({ _id: { $in: [...driverDocIds] } }).select("userId").lean();
+        const dateLabel = schedule.dayName || schedule.date.toISOString().split("T")[0];
+        for (const d of drivers) {
+          if (d.userId) {
+            const areas = driverAreaMap[d._id.toString()] || [];
+            const areasList = areas.join(", ");
+
+            // Emit real-time socket event
+            io.to(`driver:${d.userId}`).emit("schedule:confirmed", {
+              scheduleId: schedule._id,
+              date: schedule.date,
+              dayName: schedule.dayName,
+              message: `Schedule confirmed for ${dateLabel}. You are assigned to: ${areasList}`,
+            });
+
+            // Create persistent notification for this driver
+            await createSystemNotification({
+              type: "schedule_confirmed",
+              title: `Schedule Confirmed — ${dateLabel}`,
+              message: `You have been assigned to ${areas.length} area${areas.length !== 1 ? "s" : ""}: ${areasList}. Check your daily schedule for details.`,
+              severity: "info",
+              targetRoles: ["driver"],
+              relatedData: {
+                scheduleId: schedule._id,
+                date: schedule.date.toISOString().split("T")[0],
+                areaName: areasList,
+              },
+              targetUserId: d.userId,
+            });
+          }
+        }
+      }
+      // Also broadcast to all drivers room for general awareness
+      io.to("drivers").emit("schedule:updated", {
+        scheduleId: schedule._id,
+        status: "confirmed",
+      });
+    } catch (_) { /* socket may not be ready */ }
+
     res.status(200).json({
       success: true,
       message: "Schedule confirmed for dispatch",
@@ -575,10 +715,27 @@ export const getPublicMLSchedule = async (req, res) => {
       status: "confirmed",
     }).lean();
 
-    // If none found for today, find the latest confirmed schedule (any date)
+    // Fallback: today's draft schedule (generated but not yet confirmed)
+    if (!schedule) {
+      schedule = await MLSchedule.findOne({
+        date: { $gte: today, $lt: tomorrow },
+        status: "draft",
+      }).lean();
+    }
+
+    // Fallback: latest confirmed schedule (any date)
     if (!schedule) {
       schedule = await MLSchedule.findOne({
         status: "confirmed",
+      })
+        .sort({ date: -1 })
+        .lean();
+    }
+
+    // Fallback: latest draft schedule (any date)
+    if (!schedule) {
+      schedule = await MLSchedule.findOne({
+        status: "draft",
       })
         .sort({ date: -1 })
         .lean();
@@ -601,7 +758,8 @@ export const getPublicMLSchedule = async (req, res) => {
         status: schedule.status,
         totalPredictedWasteKg: schedule.totalPredictedWasteKg,
         summary: schedule.summary,
-        districts: schedule.districts,
+        areas: schedule.areas,
+        createdAt: schedule.createdAt,
       },
     });
   } catch (error) {
@@ -682,13 +840,13 @@ export const autoGenerateMLSchedule = async () => {
     const trucksWithDrivers = allTrucks.filter((t) => t.driver_id);
     const driverlessTrucksList = allTrucks.filter((t) => !t.driver_id);
 
-    // Build district→org map for org-scoped truck assignment
-    const allDistricts = await District.find({ isActive: true }).populate("orgId", "name").lean();
-    const districtOrgMap = {};
-    const districtOrgNameMap = {};
-    for (const d of allDistricts) {
-      districtOrgMap[d.name.toLowerCase()] = d.orgId?._id?.toString() || null;
-      districtOrgNameMap[d.name.toLowerCase()] = d.orgId?.name || null;
+    // Build area→org map for org-scoped truck assignment
+    const allAreas = await Area.find({ isActive: true }).populate("orgId", "name").lean();
+    const areaOrgMap = {};
+    const areaOrgNameMap = {};
+    for (const a of allAreas) {
+      areaOrgMap[a.name.toLowerCase()] = a.orgId?._id?.toString() || null;
+      areaOrgNameMap[a.name.toLowerCase()] = a.orgId?.name || null;
     }
 
     // 4. Call ML service
@@ -702,11 +860,11 @@ export const autoGenerateMLSchedule = async () => {
     }
 
     // Org-aware truck assignment: use ML predictions but assign trucks ourselves
-    const { districtsData, summary: assignmentSummary } = assignTrucksToDistricts(
+    const { areasData, summary: assignmentSummary } = assignTrucksToAreas(
       result.districts,
       trucksWithDrivers,
-      districtOrgMap,
-      districtOrgNameMap
+      areaOrgMap,
+      areaOrgNameMap
     );
 
     // 5. Save schedule to database
@@ -716,7 +874,7 @@ export const autoGenerateMLSchedule = async () => {
       status: "draft",
       totalPredictedWasteKg: result.summary.total_predicted_waste_kg,
       summary: {
-        totalDistricts: assignmentSummary.totalDistricts,
+        totalAreas: assignmentSummary.totalAreas,
         dispatched: assignmentSummary.dispatched,
         skipped: assignmentSummary.skipped,
         reduced: assignmentSummary.reduced,
@@ -725,7 +883,7 @@ export const autoGenerateMLSchedule = async () => {
         driverlessTrucks: driverlessTrucksList.length,
         unavailableDrivers: result.summary.unavailable_drivers,
       },
-      districts: districtsData,
+      areas: areasData,
       generatedBy: null,
       mlModelInfo: {
         model: "GradientBoosting",
@@ -771,13 +929,13 @@ export const autoGenerateMLSchedule = async () => {
       }
     }
 
-    // Notify about skipped districts
-    const skippedDistricts = districtsData.filter(d => d.action === "skip" && d.skipReason);
-    if (skippedDistricts.length > 0) {
+    // Notify about skipped areas
+    const skippedAreas = areasData.filter(d => d.action === "skip" && d.skipReason);
+    if (skippedAreas.length > 0) {
       await createSystemNotification({
         type: "schedule_failed",
-        title: "Districts Skipped in Auto-Schedule",
-        message: `${skippedDistricts.length} district(s) were skipped on ${dateStr}: ${skippedDistricts.map(d => `${d.district} (${d.skipReason})`).join("; ")}`,
+        title: "Areas Skipped in Auto-Schedule",
+        message: `${skippedAreas.length} area(s) were skipped on ${dateStr}: ${skippedAreas.map(d => `${d.area} (${d.skipReason})`).join("; ")}`,
         severity: "critical",
         targetRoles: ["super_admin"],
         relatedData: {
@@ -807,7 +965,7 @@ export const autoGenerateMLSchedule = async () => {
  *
  * Returns:
  * - wasteTrend: last 30 days of predicted waste (for line chart)
- * - districtBreakdown: waste by district (for bar chart)
+ * - areaBreakdown: waste by area (for bar chart)
  * - categoryDistribution: waste categories across schedules (for pie chart)
  * - scheduleStats: confirmed/draft/cancelled counts (for doughnut)
  * - actionDistribution: dispatch/skip/reduced counts
@@ -835,32 +993,33 @@ export const getMLAnalytics = async (req, res) => {
       dispatched: s.summary?.dispatched || 0,
     }));
 
-    // 2. District Breakdown (bar chart: avg waste per district)
-    const districtTotals = {};
-    const districtCounts = {};
+    // 2. Area Breakdown (bar chart: avg waste per area)
+    const areaTotals = {};
+    const areaCounts = {};
     for (const s of schedules) {
-      for (const d of s.districts) {
-        if (!districtTotals[d.district]) {
-          districtTotals[d.district] = 0;
-          districtCounts[d.district] = 0;
+      for (const d of (s.areas || [])) {
+        if (!d.area) continue;
+        if (!areaTotals[d.area]) {
+          areaTotals[d.area] = 0;
+          areaCounts[d.area] = 0;
         }
-        districtTotals[d.district] += d.predictedWasteKg;
-        districtCounts[d.district] += 1;
+        areaTotals[d.area] += d.predictedWasteKg;
+        areaCounts[d.area] += 1;
       }
     }
-    const districtBreakdown = Object.entries(districtTotals)
-      .map(([district, total]) => ({
-        district,
+    const areaBreakdown = Object.entries(areaTotals)
+      .map(([area, total]) => ({
+        area,
         totalWasteKg: Math.round(total),
-        avgWasteKg: Math.round(total / (districtCounts[district] || 1)),
-        scheduleCount: districtCounts[district],
+        avgWasteKg: Math.round(total / (areaCounts[area] || 1)),
+        scheduleCount: areaCounts[area],
       }))
       .sort((a, b) => b.avgWasteKg - a.avgWasteKg);
 
     // 3. Category Distribution (pie chart)
     const categoryCounts = { none: 0, low: 0, medium: 0, high: 0, critical: 0 };
     for (const s of schedules) {
-      for (const d of s.districts) {
+      for (const d of (s.areas || [])) {
         if (d.wasteCategory) categoryCounts[d.wasteCategory]++;
       }
     }
@@ -880,7 +1039,7 @@ export const getMLAnalytics = async (req, res) => {
     // 5. Action Distribution (how many dispatches vs skips vs reduced)
     const actionCounts = { dispatch: 0, skip: 0, reduced: 0 };
     for (const s of schedules) {
-      for (const d of s.districts) {
+      for (const d of (s.areas || [])) {
         if (d.action) actionCounts[d.action]++;
       }
     }
@@ -915,14 +1074,14 @@ export const getMLAnalytics = async (req, res) => {
           )
         : 0;
 
-    // 7. Incomplete/Failed districts report (skipped with reasons)
-    const incompleteDistricts = [];
+    // 7. Incomplete/Failed areas report (skipped with reasons)
+    const incompleteAreas = [];
     for (const s of schedules) {
-      for (const d of s.districts) {
+      for (const d of (s.areas || [])) {
         if (d.action === "skip" || (d.action === "reduced" && (!d.assignedTrucks || d.assignedTrucks.length === 0))) {
-          incompleteDistricts.push({
-            district: d.district,
-            districtType: d.districtType,
+          incompleteAreas.push({
+            area: d.area,
+            areaType: d.areaType,
             date: s.date.toISOString().split("T")[0],
             dayName: s.dayName,
             predictedWasteKg: d.predictedWasteKg,
@@ -945,9 +1104,9 @@ export const getMLAnalytics = async (req, res) => {
         totalTrucks: (s.summary.totalTrucksAvailable || 0) + s.summary.driverlessTrucks,
       }));
 
-    // 9. Reason breakdown for skipped districts
+    // 9. Reason breakdown for skipped areas
     const reasonCounts = {};
-    for (const d of incompleteDistricts) {
+    for (const d of incompleteAreas) {
       const reason = d.reason || "Unknown";
       reasonCounts[reason] = (reasonCounts[reason] || 0) + 1;
     }
@@ -957,7 +1116,7 @@ export const getMLAnalytics = async (req, res) => {
       success: true,
       data: {
         wasteTrend,
-        districtBreakdown,
+        areaBreakdown,
         categoryDistribution,
         scheduleStats,
         actionDistribution,
@@ -970,7 +1129,7 @@ export const getMLAnalytics = async (req, res) => {
         },
         totalSchedules: schedules.length,
         modelInfo: { model: "GradientBoosting", r2Score: 0.974 },
-        incompleteDistricts,
+        incompleteAreas,
         driverlessTruckStats,
         reasonBreakdown,
       },
@@ -1025,7 +1184,7 @@ export const getDriverMLAssignments = async (req, res) => {
     console.log(`[DriverAssignments] driverId=${driverId}, today=${today.toISOString()}, dayAfter=${dayAfter.toISOString()}, schedulesFound=${schedules.length}`);
     if (schedules.length > 0) {
       for (const s of schedules) {
-        const allDriverIds = s.districts.flatMap(d => d.assignedTrucks.map(t => t.driverId));
+        const allDriverIds = s.areas.flatMap(d => d.assignedTrucks.map(t => t.driverId));
         console.log(`[DriverAssignments] schedule date=${s.date}, status=${s.status}, driverIdsInSchedule=${JSON.stringify(allDriverIds)}`);
       }
     }
@@ -1034,19 +1193,21 @@ export const getDriverMLAssignments = async (req, res) => {
     const extractAssignments = (schedule) => {
       if (!schedule) return null;
       const assignments = [];
-      for (const district of schedule.districts) {
-        for (const truck of district.assignedTrucks) {
+      for (const areaEntry of schedule.areas) {
+        for (const truck of areaEntry.assignedTrucks) {
           if (truck.driverId === driverId) {
             assignments.push({
-              district: district.district,
-              districtType: district.districtType,
-              predictedWasteKg: district.predictedWasteKg,
-              wasteCategory: district.wasteCategory,
-              action: district.action,
-              isHoliday: district.isHoliday,
-              holidayName: district.holidayName,
-              recommendation: district.recommendation,
-              orgName: district.orgName || null,
+              area: areaEntry.area,
+              areaType: areaEntry.areaType,
+              predictedWasteKg: areaEntry.predictedWasteKg,
+              wasteCategory: areaEntry.wasteCategory,
+              action: areaEntry.action,
+              isHoliday: areaEntry.isHoliday,
+              holidayName: areaEntry.holidayName,
+              recommendation: areaEntry.recommendation,
+              orgName: areaEntry.orgName || null,
+              completionStatus: truck.completionStatus || "pending",
+              completedAt: truck.completedAt || null,
               truck: {
                 truckId: truck.truckId,
                 licensePlate: truck.licensePlate,
@@ -1093,17 +1254,243 @@ export const getDriverMLAssignments = async (req, res) => {
 };
 
 /**
- * Redispatch a single district in an existing schedule.
- * POST /api/ml-schedule/:id/redispatch
- * Body: { district }
+ * Driver marks their area assignment as completed.
+ * POST /api/ml-schedule/:id/complete-area
+ * Body: { area, note? }
  */
-export const redispatchDistrict = async (req, res) => {
+export const completeAreaAssignment = async (req, res) => {
   try {
     const { id } = req.params;
-    const { district: districtName } = req.body;
+    const { area: areaName, note } = req.body;
+    const userId = req.user._id;
 
-    if (!districtName) {
-      return res.status(400).json({ success: false, message: "district name is required" });
+    if (!areaName) {
+      return res.status(400).json({ success: false, message: "area name is required" });
+    }
+
+    // Find the driver document for this user
+    const driver = await Driver.findOne({ userId }).lean();
+    if (!driver) {
+      return res.status(404).json({ success: false, message: "Driver profile not found" });
+    }
+
+    const driverId = driver._id.toString();
+
+    const schedule = await MLSchedule.findById(id);
+    if (!schedule) {
+      return res.status(404).json({ success: false, message: "Schedule not found" });
+    }
+
+    if (schedule.status !== "confirmed" && schedule.status !== "completed") {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot complete assignments on a '${schedule.status}' schedule. Schedule must be confirmed first.`,
+      });
+    }
+
+    const areaEntry = schedule.areas.find((d) => d.area === areaName);
+    if (!areaEntry) {
+      return res.status(404).json({ success: false, message: `Area '${areaName}' not found in schedule` });
+    }
+
+    // Find the truck assignment for THIS driver
+    const truckAssignment = areaEntry.assignedTrucks.find((t) => t.driverId === driverId);
+    if (!truckAssignment) {
+      return res.status(403).json({ success: false, message: "You are not assigned to this area" });
+    }
+
+    if (truckAssignment.completionStatus === "completed") {
+      return res.status(400).json({ success: false, message: "This assignment is already marked as completed" });
+    }
+
+    // Mark as completed
+    truckAssignment.completionStatus = "completed";
+    truckAssignment.completedAt = new Date();
+    truckAssignment.completedBy = userId.toString();
+    truckAssignment.completionNote = note || null;
+
+    // Check if ALL truck assignments across ALL areas in this schedule are completed
+    const allCompleted = schedule.areas.every((a) =>
+      a.assignedTrucks.every(
+        (t) => t.completionStatus === "completed" || a.action === "skip"
+      )
+    );
+
+    if (allCompleted) {
+      schedule.status = "completed";
+    }
+
+    await schedule.save();
+
+    // Notify admins about completion via socket
+    try {
+      const io = getIO();
+      const driverName = driver.userId ? (await User.findById(driver.userId).select("name").lean())?.name : "Unknown";
+
+      io.to("admins").emit("schedule:area-completed", {
+        scheduleId: schedule._id,
+        area: areaName,
+        driverName,
+        licensePlate: truckAssignment.licensePlate,
+        completedAt: truckAssignment.completedAt,
+        allCompleted,
+        date: schedule.date.toISOString().split("T")[0],
+      });
+
+      // Notify the driver back with confirmation
+      io.to(`driver:${userId}`).emit("assignment:completed", {
+        scheduleId: schedule._id,
+        area: areaName,
+        message: `You completed collection at ${areaName}`,
+      });
+
+      // Create persistent notification for admins
+      await createSystemNotification({
+        type: "area_completed",
+        title: `Collection Completed — ${areaName}`,
+        message: `${driverName} completed waste collection at ${areaName} (${truckAssignment.licensePlate}).${allCompleted ? " All assignments for this schedule are now complete." : ""}`,
+        severity: "info",
+        targetRoles: ["admin", "super_admin"],
+        relatedData: {
+          scheduleId: schedule._id,
+          area: areaName,
+          driverId,
+          date: schedule.date.toISOString().split("T")[0],
+        },
+      });
+    } catch (_) { /* socket may not be ready */ }
+
+    res.status(200).json({
+      success: true,
+      message: allCompleted
+        ? `Area '${areaName}' completed. All assignments done — schedule marked as completed!`
+        : `Area '${areaName}' marked as completed`,
+      data: {
+        area: areaName,
+        completionStatus: "completed",
+        completedAt: truckAssignment.completedAt,
+        scheduleCompleted: allCompleted,
+      },
+    });
+  } catch (error) {
+    console.error("Complete area assignment error:", error);
+    res.status(500).json({ success: false, message: "Failed to complete assignment", error: error.message });
+  }
+};
+
+/**
+ * Get schedule completion history — for admins/super_admin and drivers.
+ * GET /api/ml-schedule/completions
+ * Query: { page, limit, driverId? }
+ */
+export const getScheduleCompletions = async (req, res) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+    const role = req.user.role;
+    const userId = req.user._id;
+
+    // Get schedules that have at least one completed assignment
+    const filter = {
+      status: { $in: ["confirmed", "completed"] },
+      "areas.assignedTrucks.completionStatus": "completed",
+    };
+
+    const schedules = await MLSchedule.find(filter)
+      .sort({ date: -1 })
+      .skip((parseInt(page) - 1) * parseInt(limit))
+      .limit(parseInt(limit))
+      .lean();
+
+    const total = await MLSchedule.countDocuments(filter);
+
+    // For drivers, filter to only their completions
+    let completions = [];
+
+    if (role === "driver") {
+      const driver = await Driver.findOne({ userId }).lean();
+      const driverId = driver?._id?.toString();
+
+      for (const s of schedules) {
+        for (const area of s.areas) {
+          for (const truck of area.assignedTrucks) {
+            if (truck.driverId === driverId && truck.completionStatus === "completed") {
+              completions.push({
+                scheduleId: s._id,
+                date: s.date.toISOString().split("T")[0],
+                dayName: s.dayName,
+                area: area.area,
+                areaType: area.areaType,
+                predictedWasteKg: area.predictedWasteKg,
+                wasteCategory: area.wasteCategory,
+                truck: {
+                  licensePlate: truck.licensePlate,
+                  truckType: truck.truckType,
+                  capacity: truck.capacity,
+                },
+                completedAt: truck.completedAt,
+                completionNote: truck.completionNote,
+                driverName: truck.driverName,
+              });
+            }
+          }
+        }
+      }
+    } else {
+      // Admin/super_admin — show all completions
+      for (const s of schedules) {
+        for (const area of s.areas) {
+          for (const truck of area.assignedTrucks) {
+            if (truck.completionStatus === "completed") {
+              completions.push({
+                scheduleId: s._id,
+                date: s.date.toISOString().split("T")[0],
+                dayName: s.dayName,
+                area: area.area,
+                areaType: area.areaType,
+                predictedWasteKg: area.predictedWasteKg,
+                wasteCategory: area.wasteCategory,
+                orgName: area.orgName || truck.orgName,
+                truck: {
+                  licensePlate: truck.licensePlate,
+                  truckType: truck.truckType,
+                  capacity: truck.capacity,
+                },
+                completedAt: truck.completedAt,
+                completionNote: truck.completionNote,
+                driverName: truck.driverName,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    // Sort by completedAt desc
+    completions.sort((a, b) => new Date(b.completedAt) - new Date(a.completedAt));
+
+    res.status(200).json({
+      success: true,
+      data: completions,
+      pagination: { page: parseInt(page), limit: parseInt(limit), total },
+    });
+  } catch (error) {
+    console.error("Get schedule completions error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch completions", error: error.message });
+  }
+};
+
+/**
+ * Redispatch a single area in an existing schedule.
+ * POST /api/ml-schedule/:id/redispatch
+ * Body: { area }
+ */
+export const redispatchArea = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { area: areaName } = req.body;
+
+    if (!areaName) {
+      return res.status(400).json({ success: false, message: "area name is required" });
     }
 
     const schedule = await MLSchedule.findById(id);
@@ -1111,9 +1498,9 @@ export const redispatchDistrict = async (req, res) => {
       return res.status(404).json({ success: false, message: "Schedule not found" });
     }
 
-    const districtEntry = schedule.districts.find((d) => d.district === districtName);
-    if (!districtEntry) {
-      return res.status(404).json({ success: false, message: `District '${districtName}' not found in schedule` });
+    const areaEntry = schedule.areas.find((d) => d.area === areaName);
+    if (!areaEntry) {
+      return res.status(404).json({ success: false, message: `Area '${areaName}' not found in schedule` });
     }
 
     // Fetch current available trucks WITH drivers
@@ -1133,7 +1520,7 @@ export const redispatchDistrict = async (req, res) => {
 
     // Get trucks with drivers that are NOT already assigned in this schedule
     const assignedTruckIds = new Set();
-    for (const d of schedule.districts) {
+    for (const d of schedule.areas) {
       for (const t of d.assignedTrucks) {
         assignedTruckIds.add(t.truckId);
       }
@@ -1168,26 +1555,26 @@ export const redispatchDistrict = async (req, res) => {
       });
     }
 
-    // Get the org of this district for org-aware truck selection
-    const districtDoc = await District.findOne({ name: districtName }).populate("orgId", "name").lean();
-    const districtOrgId = districtDoc?.orgId?._id?.toString() || null;
+    // Get the org of this area for org-aware truck selection
+    const areaDoc = await Area.findOne({ name: areaName }).populate("orgId", "name").lean();
+    const areaOrgId = areaDoc?.orgId?._id?.toString() || null;
 
     // Prefer trucks from the same org, fall back to any available truck
-    let orgTrucks = districtOrgId
-      ? availableTrucks.filter((t) => t.org_id === districtOrgId)
+    let orgTrucks = areaOrgId
+      ? availableTrucks.filter((t) => t.org_id === areaOrgId)
       : availableTrucks;
     if (orgTrucks.length === 0) orgTrucks = availableTrucks;
 
-    // Call ML service to predict for this single district
+    // Call ML service to predict for this single area
     const dateStr = schedule.date.toISOString().split("T")[0];
-    const prediction = await mlPredict(districtName, dateStr);
+    const prediction = await mlPredict(areaName, dateStr);
 
     if (prediction.fallback) {
       return res.status(503).json({ success: false, message: "ML service unavailable" });
     }
 
     // Pick the best truck by capacity match from org-filtered list
-    const neededKg = prediction.predicted_waste_kg || districtEntry.predictedWasteKg;
+    const neededKg = prediction.predicted_waste_kg || areaEntry.predictedWasteKg;
     orgTrucks.sort((a, b) => {
       const diffA = Math.abs(a.capacity_kg - neededKg);
       const diffB = Math.abs(b.capacity_kg - neededKg);
@@ -1196,11 +1583,11 @@ export const redispatchDistrict = async (req, res) => {
 
     const assignedTruck = orgTrucks[0];
 
-    // Update the district entry
-    districtEntry.action = "dispatch";
-    districtEntry.skipReason = null;
-    districtEntry.recommendation = `Redispatched with truck ${assignedTruck.license_plate}`;
-    districtEntry.assignedTrucks = [{
+    // Update the area entry
+    areaEntry.action = "dispatch";
+    areaEntry.skipReason = null;
+    areaEntry.recommendation = `Redispatched with truck ${assignedTruck.license_plate}`;
+    areaEntry.assignedTrucks = [{
       truckId: assignedTruck.id,
       licensePlate: assignedTruck.license_plate,
       driverName: assignedTruck.driver_name,
@@ -1212,8 +1599,8 @@ export const redispatchDistrict = async (req, res) => {
     }];
 
     // Update summary counts
-    const dispatched = schedule.districts.filter((d) => d.action === "dispatch").length;
-    const skipped = schedule.districts.filter((d) => d.action === "skip").length;
+    const dispatched = schedule.areas.filter((d) => d.action === "dispatch").length;
+    const skipped = schedule.areas.filter((d) => d.action === "skip").length;
     schedule.summary.dispatched = dispatched;
     schedule.summary.skipped = skipped;
 
@@ -1221,11 +1608,11 @@ export const redispatchDistrict = async (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: `District '${districtName}' redispatched with truck ${assignedTruck.license_plate}`,
+      message: `Area '${areaName}' redispatched with truck ${assignedTruck.license_plate}`,
       data: schedule,
     });
   } catch (error) {
-    console.error("Redispatch district error:", error);
-    res.status(500).json({ success: false, message: "Failed to redispatch district", error: error.message });
+    console.error("Redispatch area error:", error);
+    res.status(500).json({ success: false, message: "Failed to redispatch area", error: error.message });
   }
 };

@@ -8,12 +8,20 @@ const assignedTruckSchema = new mongoose.Schema({
   capacity: { type: Number },
   truckType: { type: String },
   orgId: { type: String },
-  orgName: { type: String }
+  orgName: { type: String },
+  completionStatus: {
+    type: String,
+    enum: ["pending", "in_progress", "completed", "failed"],
+    default: "pending",
+  },
+  completedAt: { type: Date, default: null },
+  completedBy: { type: String, default: null },
+  completionNote: { type: String, default: null },
 }, { _id: false });
 
-const districtEntrySchema = new mongoose.Schema({
-  district: { type: String, required: true },
-  districtType: { type: String },
+const areaEntrySchema = new mongoose.Schema({
+  area: { type: String, required: true },
+  areaType: { type: String },
   predictedWasteKg: { type: Number, default: 0 },
   wasteCategory: {
     type: String,
@@ -50,7 +58,7 @@ const mlScheduleSchema = new mongoose.Schema({
     default: 0
   },
   summary: {
-    totalDistricts: { type: Number },
+    totalAreas: { type: Number },
     dispatched: { type: Number },
     skipped: { type: Number },
     reduced: { type: Number },
@@ -59,7 +67,7 @@ const mlScheduleSchema = new mongoose.Schema({
     driverlessTrucks: { type: Number, default: 0 },
     unavailableDrivers: [{ type: String }]
   },
-  districts: [districtEntrySchema],
+  areas: [areaEntrySchema],
   generatedBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "User"

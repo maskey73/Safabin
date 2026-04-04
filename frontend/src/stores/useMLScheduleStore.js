@@ -114,11 +114,11 @@ const useMLScheduleStore = create((set, get) => ({
         }
     },
 
-    // Predict waste for a single district
-    predictDistrict: async (district, date) => {
+    // Predict waste for a single area
+    predictArea: async (area, date) => {
         set({ loading: true, error: null });
         try {
-            const response = await api.post("/ml-schedule/predict", { district, date });
+            const response = await api.post("/ml-schedule/predict", { area, date });
             set({
                 prediction: response.data.data,
                 loading: false,
@@ -182,12 +182,12 @@ const useMLScheduleStore = create((set, get) => ({
         }
     },
 
-    // Redispatch a skipped district
-    redispatchDistrict: async (scheduleId, districtName) => {
+    // Redispatch a skipped area
+    redispatchArea: async (scheduleId, areaName) => {
         set({ loading: true, error: null });
         try {
             const response = await api.post(`/ml-schedule/${scheduleId}/redispatch`, {
-                district: districtName,
+                area: areaName,
             });
             set({
                 currentSchedule: response.data.data,
@@ -195,12 +195,50 @@ const useMLScheduleStore = create((set, get) => ({
             });
             return response.data;
         } catch (error) {
-            console.error("Failed to redispatch district:", error);
+            console.error("Failed to redispatch area:", error);
             set({
-                error: error.response?.data?.message || "Failed to redispatch district",
+                error: error.response?.data?.message || "Failed to redispatch area",
                 loading: false,
             });
             return null;
+        }
+    },
+
+    // Driver marks an area assignment as completed
+    completeAssignment: async (scheduleId, areaName, note = "") => {
+        set({ loading: true, error: null });
+        try {
+            const response = await api.post(`/ml-schedule/${scheduleId}/complete-area`, {
+                area: areaName,
+                note,
+            });
+            // Refresh driver assignments after completion
+            get().fetchDriverAssignments();
+            set({ loading: false });
+            return response.data;
+        } catch (error) {
+            console.error("Failed to complete assignment:", error);
+            set({
+                error: error.response?.data?.message || "Failed to mark assignment as completed",
+                loading: false,
+            });
+            return null;
+        }
+    },
+
+    // Fetch completion history
+    completions: [],
+    fetchCompletions: async (page = 1) => {
+        set({ loading: true, error: null });
+        try {
+            const response = await api.get(`/ml-schedule/completions?page=${page}&limit=50`);
+            set({ completions: response.data.data || [], loading: false });
+        } catch (error) {
+            console.error("Failed to fetch completions:", error);
+            set({
+                error: error.response?.data?.message || "Failed to fetch completion history",
+                loading: false,
+            });
         }
     },
 

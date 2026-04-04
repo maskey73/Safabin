@@ -21,14 +21,21 @@ const mlApi = axios.create({
 });
 
 /**
- * Predict waste for a single district on a specific date.
+ * Predict waste for a single area on a specific date.
+ * Known areas use direct model prediction.
+ * Unknown areas require district_type and optional scale_factor for type-based prediction.
  */
-export async function predictDistrict(district, date) {
+export async function predictArea(area, date, districtType = null, scaleFactor = 1.0) {
   try {
-    const response = await mlApi.post("/predict", { district, date });
+    const payload = { district: area, date };
+    if (districtType) {
+      payload.district_type = districtType;
+      payload.scale_factor = scaleFactor;
+    }
+    const response = await mlApi.post("/predict", payload);
     return response.data;
   } catch (error) {
-    console.error("[mlClient] predictDistrict error:", error.message);
+    console.error("[mlClient] predictArea error:", error.message);
     return {
       error: "ML service unavailable — could not get prediction",
       detail: error.message,
@@ -38,18 +45,21 @@ export async function predictDistrict(district, date) {
 }
 
 /**
- * Generate a full day schedule with truck assignments for all districts.
- * Now sends real trucks from MongoDB to the ML service.
+ * Generate a full day schedule with truck assignments for all areas.
+ * Sends real trucks from MongoDB to the ML service.
  * @param {string} date - ISO date string
  * @param {Object[]} trucks - Real truck data from MongoDB
  * @param {string[]} unavailableDrivers - Driver IDs that are unavailable
+ * @param {Object[]} extraAreas - New areas from DB for type-based prediction
+ *   Each: { name, type, scale_factor }
  */
-export async function generateSchedule(date, trucks = [], unavailableDrivers = []) {
+export async function generateSchedule(date, trucks = [], unavailableDrivers = [], extraAreas = []) {
   try {
     const response = await mlApi.post("/schedule", {
       date,
       trucks,
       unavailable_drivers: unavailableDrivers,
+      extra_areas: extraAreas,
     });
     return response.data;
   } catch (error) {
@@ -63,16 +73,17 @@ export async function generateSchedule(date, trucks = [], unavailableDrivers = [
 }
 
 /**
- * Get list of supported districts from ML service.
+ * Get list of supported areas from ML service.
+ * Note: ML service endpoint is still /districts internally.
  */
-export async function getMLDistricts() {
+export async function getMLAreas() {
   try {
     const response = await mlApi.get("/districts");
     return response.data;
   } catch (error) {
-    console.error("[mlClient] getMLDistricts error:", error.message);
+    console.error("[mlClient] getMLAreas error:", error.message);
     return {
-      error: "ML service unavailable — could not fetch districts",
+      error: "ML service unavailable — could not fetch areas",
       detail: error.message,
       fallback: true,
     };
