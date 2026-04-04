@@ -1,38 +1,40 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
+import {
+  MapPin, Tag, Gauge, Clock, AlertCircle, CheckCircle,
+  ArrowLeft, Loader2, Package, ChevronRight, X,
+} from "lucide-react";
+import { getSocket } from "../../utils/socket";
 import api from "../../utils/api";
 
 export default function AcceptTaskPage() {
   const navigate = useNavigate();
   const routerLocation = useLocation();
 
-  // pickupId either from DriverDashboard navigation state or from the
-  // first PENDING pickup fetched from the server
   const [pickupId, setPickupId] = useState(routerLocation.state?.pickupId || null);
   const [pickup, setPickup] = useState(null);
   const [isFetching, setIsFetching] = useState(true);
   const [isAccepting, setIsAccepting] = useState(false);
-  const [isDeclining, _setIsDeclining] = useState(false);
+  const [isDeclining] = useState(false);
   const [error, setError] = useState(null);
+  const [takenByOther, setTakenByOther] = useState(false);
+  const [newPickupAlert, setNewPickupAlert] = useState(null);
+  const alertTimeoutRef = useRef(null);
 
-  // ── Fetch pickup details on mount ────────────────────────────────────────
   useEffect(() => {
     const load = async () => {
       setIsFetching(true);
       setError(null);
-
       try {
         if (pickupId) {
-          // Fetch the specific pickup passed from DriverDashboard
           const res = await api.get(`/pickups/${pickupId}`);
           setPickup(res.data.pickup);
         } else {
-          // Fallback: fetch the first available PENDING request
           const res = await api.get("/pickups/pending");
           const first = res.data.pickups?.[0] || null;
           if (first) {
             setPickup(first);
-            setPickupId(first.id);
+            setPickupId(first.id || first._id);
           }
         }
       } catch (err) {
@@ -41,24 +43,64 @@ export default function AcceptTaskPage() {
         setIsFetching(false);
       }
     };
-
     load();
   }, [pickupId]);
 
-  // ── Accept ───────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const socket = getSocket();
+
+    const onAccepted = ({ id, _id }) => {
+      const acceptedId = id || _id;
+      if (pickupId && acceptedId?.toString() === pickupId?.toString()) {
+        setTakenByOther(true);
+        setError("This request was just accepted by another driver.");
+      }
+    };
+
+    const onCancelled = ({ id, _id }) => {
+      const cancelledId = id || _id;
+      if (pickupId && cancelledId?.toString() === pickupId?.toString()) {
+        setError("This pickup request has been cancelled.");
+        setPickup(null);
+      }
+    };
+
+    const onCreated = (newPickup) => {
+      if (!pickupId || takenByOther) {
+        setPickup(newPickup);
+        setPickupId(newPickup.id || newPickup._id);
+        setError(null);
+        setTakenByOther(false);
+      } else {
+        setNewPickupAlert(newPickup);
+        if (alertTimeoutRef.current) clearTimeout(alertTimeoutRef.current);
+        alertTimeoutRef.current = setTimeout(() => setNewPickupAlert(null), 8000);
+      }
+    };
+
+    socket.on("pickup:accepted", onAccepted);
+    socket.on("pickup:cancelled", onCancelled);
+    socket.on("pickup:created", onCreated);
+
+    return () => {
+      socket.off("pickup:accepted", onAccepted);
+      socket.off("pickup:cancelled", onCancelled);
+      socket.off("pickup:created", onCreated);
+      if (alertTimeoutRef.current) clearTimeout(alertTimeoutRef.current);
+    };
+  }, [pickupId, takenByOther]);
+
   const handleAccept = async () => {
     if (isAccepting || isDeclining || !pickupId) return;
     setIsAccepting(true);
     setError(null);
-
     try {
       await api.post(`/pickups/${pickupId}/accept`);
-      // Navigate to task route page with the pickup data
       navigate(`/task-route/${pickupId}`, { replace: true, state: { pickup } });
     } catch (err) {
       const msg = err.response?.data?.message || "Failed to accept";
       if (err.response?.status === 409) {
-        // Race condition: another driver was faster
+        setTakenByOther(true);
         setError("This request was just accepted by another driver.");
         setTimeout(() => navigate("/driver-dashboard"), 2000);
       } else {
@@ -69,42 +111,58 @@ export default function AcceptTaskPage() {
     }
   };
 
-  // ── Decline ──────────────────────────────────────────────────────────────
   const handleDecline = () => {
     if (isAccepting || isDeclining) return;
-    // Simply navigate away — the request stays PENDING for other drivers
     navigate("/driver-dashboard");
   };
 
-  // ── Loading skeleton ─────────────────────────────────────────────────────
+  const switchToNewPickup = () => {
+    if (newPickupAlert) {
+      setPickupId(newPickupAlert.id || newPickupAlert._id);
+      setPickup(newPickupAlert);
+      setNewPickupAlert(null);
+      setError(null);
+      setTakenByOther(false);
+    }
+  };
+
+  // Loading
   if (isFetching) {
     return (
-      <div className="app-bg">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 py-10 flex items-center justify-center min-h-[50vh]">
-          <div className="flex flex-col items-center gap-3 text-[var(--primary)]/60">
-            <Spinner />
-            <p className="text-sm font-medium">Loading request…</p>
-          </div>
+      <div className="min-h-screen bg-[#f5f3ee] flex items-center justify-center">
+        <div className="flex flex-col items-center gap-3 text-primary/60">
+          <Loader2 size={28} className="animate-spin" />
+          <p className="text-sm font-medium">Loading request...</p>
         </div>
       </div>
     );
   }
 
-  // ── No pickup found ──────────────────────────────────────────────────────
+  // No pickup
   if (!pickup) {
     return (
-      <div className="app-bg">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 py-10 flex flex-col items-center justify-center min-h-[50vh] gap-4">
-          <p className="text-[var(--primary)] font-semibold text-lg">
-            {error || "No pending pickup requests at the moment."}
-          </p>
-          <button
-            onClick={() => navigate("/driver-dashboard")}
-            className="px-6 py-3 rounded-2xl bg-[#213a3d] text-white font-semibold hover:opacity-90 transition"
-          >
-            Back to Dashboard
+      <div className="min-h-screen bg-[#f5f3ee] pb-24">
+      <div className="max-w-7xl mx-auto">
+        <div className="bg-gradient-to-br from-[#354f52] to-[#2d4a4e] px-5 sm:px-8 pt-8 pb-12 sm:rounded-b-3xl">
+          <button onClick={() => navigate("/driver-dashboard")} className="flex items-center gap-2 text-white/70 hover:text-white mb-4 transition">
+            <ArrowLeft size={18} /> Back
           </button>
+          <h1 className="text-xl font-bold text-white">Pickup Requests</h1>
         </div>
+        <div className="px-5 sm:px-8 -mt-6">
+          <div className="bg-white rounded-2xl shadow-sm border border-primary/8 p-8 text-center">
+            <div className="w-16 h-16 rounded-2xl bg-primary/5 flex items-center justify-center mx-auto mb-4">
+              <Package size={28} className="text-primary/25" />
+            </div>
+            <h3 className="text-base font-semibold text-primary/70 mb-1">
+              {error || "No pending requests"}
+            </h3>
+            <p className="text-sm text-primary/40 max-w-xs mx-auto">
+              Waiting for new requests via real-time connection...
+            </p>
+          </div>
+        </div>
+      </div>
       </div>
     );
   }
@@ -112,164 +170,162 @@ export default function AcceptTaskPage() {
   const category = pickup.category || "non-recyclable";
   const level = pickup.level || "easy";
   const location = pickup.location || {};
+  const levelColor = level === "hard" ? "red" : level === "medium" ? "amber" : "emerald";
+  const categoryColor = category === "recyclable" ? "blue" : "orange";
 
   return (
-    <div className="app-bg">
-      <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6 sm:py-10">
-        {/* Top bar */}
-        <div className="flex items-start justify-between gap-4">
+    <div className="min-h-screen bg-[#f5f3ee] pb-24">
+      <div className="max-w-7xl mx-auto">
+      {/* Header */}
+      <div className="bg-gradient-to-br from-[#354f52] to-[#2d4a4e] px-5 sm:px-8 pt-8 pb-12 sm:rounded-b-3xl">
+        <button onClick={() => navigate("/driver-dashboard")} className="flex items-center gap-2 text-white/70 hover:text-white mb-4 transition">
+          <ArrowLeft size={18} /> Back
+        </button>
+        <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-2xl sm:text-4xl font-bold tracking-tight text-[var(--primary)]">
-              New Pickup Request
-            </h1>
-            <div className="mt-2 h-[3px] w-56 bg-[var(--accent)] rounded-full" />
+            <h1 className="text-xl font-bold text-white">New Pickup Request</h1>
+            <p className="text-sm text-white/50 mt-1">Review and accept to start</p>
           </div>
-          <button
-            className="w-11 h-11 rounded-full border border-[var(--primary)]/30 bg-white flex items-center justify-center hover:shadow-sm active:scale-95 transition"
-            aria-label="Profile"
-          >
-            <UserIcon />
-          </button>
+          <div className="bg-white/10 backdrop-blur-sm rounded-xl px-3 py-2 text-right">
+            <p className="text-[10px] text-white/50 uppercase tracking-wider">ID</p>
+            <p className="text-sm font-bold text-white font-mono">
+              {(pickup.id || pickup._id)?.toString().slice(-8).toUpperCase()}
+            </p>
+          </div>
         </div>
+      </div>
 
-        {/* Error banner */}
+      <div className="px-5 sm:px-8 -mt-6 space-y-4 max-w-2xl">
+        {/* New pickup alert */}
+        {newPickupAlert && (
+          <div className="bg-blue-50 border border-blue-200 rounded-2xl px-4 py-3 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="relative flex h-2.5 w-2.5">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-blue-500" />
+              </span>
+              <p className="text-sm font-medium text-blue-700">New request available!</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button onClick={switchToNewPickup} className="text-xs font-semibold bg-blue-600 text-white px-3 py-1.5 rounded-lg hover:bg-blue-700 transition">
+                View
+              </button>
+              <button onClick={() => setNewPickupAlert(null)} className="text-blue-400 hover:text-blue-600">
+                <X size={16} />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Error */}
         {error && (
-          <div className="mt-4 rounded-xl bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-700 font-medium">
+          <div className={`rounded-2xl border px-4 py-3 flex items-center gap-3 text-sm font-medium ${
+            takenByOther ? "bg-amber-50 border-amber-200 text-amber-700" : "bg-red-50 border-red-200 text-red-700"
+          }`}>
+            <AlertCircle size={16} className="shrink-0" />
             {error}
           </div>
         )}
 
-        {/* Card */}
-        <div className="mt-6 sm:mt-8 bg-white rounded-3xl border border-[var(--primary)]/15 shadow-sm overflow-hidden">
-          {/* Header row */}
-          <div className="px-5 sm:px-7 py-5 sm:py-6 bg-[var(--accent)] border-b border-[var(--primary)]/15 flex items-center justify-between">
-            <div>
-              <p className="text-xs font-semibold tracking-wide text-[var(--primary)]/70">
-                PICKUP REQUEST DETAILS
-              </p>
-              <p className="text-sm text-[var(--primary)]/60 mt-1">
-                Review and accept to start pickup.
-              </p>
+        {/* Main Card */}
+        <div className={`bg-white rounded-2xl shadow-sm border overflow-hidden transition-all ${
+          takenByOther ? "border-red-200 opacity-60" : "border-primary/8"
+        }`}>
+          {/* Details Grid */}
+          <div className="p-5 space-y-4">
+            {/* Category & Level */}
+            <div className="grid grid-cols-2 gap-3">
+              <div className={`rounded-xl bg-${categoryColor}-50 p-4`}>
+                <div className="flex items-center gap-2 mb-2">
+                  <Tag size={14} className={`text-${categoryColor}-500`} />
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-primary/50">Category</p>
+                </div>
+                <p className={`text-sm font-bold text-${categoryColor}-700 capitalize`}>{category}</p>
+              </div>
+              <div className={`rounded-xl bg-${levelColor}-50 p-4`}>
+                <div className="flex items-center gap-2 mb-2">
+                  <Gauge size={14} className={`text-${levelColor}-500`} />
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-primary/50">Difficulty</p>
+                </div>
+                <p className={`text-sm font-bold text-${levelColor}-700 capitalize`}>{level}</p>
+              </div>
             </div>
-            <div className="text-right">
-              <p className="text-xs font-semibold text-[var(--primary)]/70">REQUEST ID</p>
-              <p className="text-sm sm:text-base font-bold text-[var(--primary)] font-mono">
-                {pickup.id?.toString().slice(-8).toUpperCase()}
-              </p>
-            </div>
-          </div>
 
-          {/* Body rows */}
-          <div className="divide-y divide-[var(--primary)]/10">
-            <Row
-              leftLabel="WASTE CATEGORY"
-              leftValue={category.toUpperCase()}
-              leftValueClass="text-[var(--accent)] font-semibold"
-              rightLabel="DIFFICULTY LEVEL"
-              rightValue={level.toUpperCase()}
-            />
-            <Row
-              leftLabel="LOCATION"
-              leftValue={
-                location.address ||
-                (location.latitude
-                  ? `${Number(location.latitude).toFixed(4)}, ${Number(location.longitude).toFixed(4)}`
-                  : "—")
-              }
-              rightLabel="STATUS"
-              rightValue={pickup.status}
-              rightValueClass="text-green-600 font-semibold"
-            />
-            <Row
-              leftLabel="POSTED"
-              leftValue={pickup.createdAt ? new Date(pickup.createdAt).toLocaleTimeString() : "—"}
-              rightLabel="EXPIRES"
-              rightValue={pickup.expiresAt ? new Date(pickup.expiresAt).toLocaleTimeString() : "—"}
-              rightValueClass="text-red-500 font-semibold"
-            />
+            {/* Location */}
+            <div className="rounded-xl bg-gray-50 p-4">
+              <div className="flex items-center gap-2 mb-2">
+                <MapPin size={14} className="text-primary/40" />
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-primary/50">Location</p>
+              </div>
+              <p className="text-sm font-semibold text-primary">
+                {location.address || (location.latitude ? `${Number(location.latitude).toFixed(4)}, ${Number(location.longitude).toFixed(4)}` : "--")}
+              </p>
+            </div>
+
+            {/* Status & Time */}
+            <div className="grid grid-cols-2 gap-3">
+              <div className="rounded-xl bg-gray-50 p-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <CheckCircle size={14} className="text-primary/40" />
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-primary/50">Status</p>
+                </div>
+                <p className={`text-sm font-bold ${takenByOther ? "text-red-600" : "text-emerald-600"}`}>
+                  {takenByOther ? "Taken" : pickup.status}
+                </p>
+              </div>
+              <div className="rounded-xl bg-gray-50 p-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <Clock size={14} className="text-primary/40" />
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-primary/50">Posted</p>
+                </div>
+                <p className="text-sm font-bold text-primary">
+                  {pickup.createdAt ? new Date(pickup.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "--"}
+                </p>
+              </div>
+            </div>
+
+            {/* Customer */}
+            {pickup.customerName && (
+              <div className="rounded-xl bg-gray-50 p-4">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-primary/50 mb-1">Customer</p>
+                <p className="text-sm font-semibold text-primary">{pickup.customerName}</p>
+              </div>
+            )}
           </div>
         </div>
 
         {/* Actions */}
-        <div className="mt-6 sm:mt-8 flex flex-col sm:flex-row gap-3 sm:gap-4">
+        <div className="flex gap-3 pt-2">
           <button
             onClick={handleAccept}
-            disabled={isAccepting || isDeclining}
-            className={`w-full sm:w-auto sm:min-w-[220px] px-8 py-4 rounded-2xl font-semibold transition shadow-sm
-              ${isAccepting || isDeclining
-                ? "bg-gray-300 text-gray-600 cursor-not-allowed"
-                : "bg-[#213a3d] text-white hover:opacity-95 active:scale-[0.99]"
-              }
-            `}
+            disabled={isAccepting || isDeclining || takenByOther}
+            className={`px-8 py-3.5 rounded-2xl font-bold text-sm transition-all shadow-sm flex items-center justify-center gap-2 ${
+              isAccepting || isDeclining || takenByOther
+                ? "bg-gray-200 text-gray-500 cursor-not-allowed"
+                : "bg-gradient-to-r from-emerald-500 to-emerald-600 text-white hover:shadow-lg active:scale-[0.98]"
+            }`}
           >
             {isAccepting ? (
-              <span className="inline-flex items-center gap-2">
-                <Spinner /> Accepting…
-              </span>
-            ) : (
-              "ACCEPT REQUEST"
+              <><Loader2 size={16} className="animate-spin" /> Accepting...</>
+            ) : takenByOther ? "Unavailable" : (
+              <><CheckCircle size={16} /> Accept Request</>
             )}
           </button>
 
           <button
             onClick={handleDecline}
             disabled={isAccepting || isDeclining}
-            className={`w-full sm:w-auto sm:min-w-[180px] px-8 py-4 rounded-2xl font-semibold transition shadow-sm
-              ${isAccepting || isDeclining
-                ? "bg-gray-300 text-gray-600 cursor-not-allowed"
-                : "bg-red-400 text-white hover:bg-red-500 active:scale-[0.99]"
-              }
-            `}
+            className={`px-6 py-3.5 rounded-2xl font-bold text-sm transition-all shadow-sm ${
+              isAccepting || isDeclining
+                ? "bg-gray-200 text-gray-500 cursor-not-allowed"
+                : "bg-white border border-primary/15 text-primary/70 hover:bg-gray-50 active:scale-[0.98]"
+            }`}
           >
-            {isDeclining ? (
-              <span className="inline-flex items-center gap-2">
-                <Spinner /> Declining…
-              </span>
-            ) : (
-              "Skip"
-            )}
+            Skip
           </button>
         </div>
-
-        <p className="mt-4 text-sm text-[var(--primary)]/60">
-          Tip: Only one driver can accept each request. Be quick!
-        </p>
+      </div>
       </div>
     </div>
-  );
-}
-
-/* ─── Sub-components ─────────────────────────────────────────────────────── */
-
-function Row({ leftLabel, leftValue, rightLabel, rightValue, leftValueClass = "", rightValueClass = "", hideRightOnMobile = false }) {
-  return (
-    <div className="px-5 sm:px-7 py-5 sm:py-6 grid grid-cols-1 sm:grid-cols-2 gap-4">
-      <div>
-        <p className="text-xs font-semibold tracking-wide text-[var(--primary)]/70">{leftLabel}</p>
-        <p className={`mt-1 text-base text-[var(--primary)] ${leftValueClass}`}>{leftValue}</p>
-      </div>
-      <div className={`${hideRightOnMobile ? "hidden sm:block" : ""} sm:text-right`}>
-        <p className="text-xs font-semibold tracking-wide text-[var(--primary)]/70">{rightLabel}</p>
-        <p className={`mt-1 text-base text-[var(--primary)] ${rightValueClass}`}>{rightValue}</p>
-      </div>
-    </div>
-  );
-}
-
-function Spinner() {
-  return (
-    <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24" aria-hidden="true">
-      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-    </svg>
-  );
-}
-
-function UserIcon() {
-  return (
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M20 21a8 8 0 1 0-16 0" stroke="currentColor" strokeWidth="2" className="text-[var(--primary)]" />
-      <path d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4Z" stroke="currentColor" strokeWidth="2" className="text-[var(--primary)]" />
-    </svg>
   );
 }
