@@ -10,6 +10,7 @@ import { getRoute } from "../services/openRouteService.js";
 import { calculatePrice } from "../services/pricingEngine.js";
 import Area from "../models/Area.model.js";
 import Organization from "../models/Organization.model.js";
+import { expireStalePendingPickups } from "../services/pickupExpiry.js";
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -70,6 +71,48 @@ function logEvent(pickupId, event, performer, fromStatus, toStatus, metadata = {
 
 function emitSafe(fn) {
   try { fn(getIO()); } catch (_) { /* socket may not be initialized */ }
+}
+
+/**
+ * Resolve an Organization for a pickup location.
+ * Tries area name first, then falls back to nearest area by GPS.
+ * Returns the org's _id, or null if nothing matches.
+ * Used when a customer doesn't have an orgId set on their account
+ * (e.g. self-signup), so pickups still get scoped to a region for
+ * admin/history/stats filtering.
+ */
+async function resolveOrgIdForLocation({ latitude, longitude, area }) {
+  let areaDoc = null;
+  if (area) {
+    areaDoc = await Area.findOne({ name: area, isActive: true, orgId: { $ne: null } }).lean();
+  }
+  if (!areaDoc && latitude != null && longitude != null) {
+    const allAreas = await Area.find({
+      isActive: true,
+      orgId: { $ne: null },
+      "coordinates.latitude": { $exists: true, $ne: null },
+      "coordinates.longitude": { $exists: true, $ne: null },
+    }).lean();
+    if (allAreas.length === 0) return null;
+
+    const toRad = (d) => (d * Math.PI) / 180;
+    const lat = Number(latitude);
+    const lng = Number(longitude);
+    let minDist = Infinity;
+    for (const a of allAreas) {
+      const dLat = toRad(a.coordinates.latitude - lat);
+      const dLng = toRad(a.coordinates.longitude - lng);
+      const sLat = Math.sin(dLat / 2);
+      const sLng = Math.sin(dLng / 2);
+      const h = sLat * sLat + Math.cos(toRad(lat)) * Math.cos(toRad(a.coordinates.latitude)) * sLng * sLng;
+      const dist = 2 * 6371 * Math.asin(Math.sqrt(h));
+      if (dist < minDist) {
+        minDist = dist;
+        areaDoc = a;
+      }
+    }
+  }
+  return areaDoc?.orgId || null;
 }
 
 // ── POST /api/pickups/estimate ─────────────────────────────────────────────
@@ -230,13 +273,26 @@ export const createPickup = async (req, res) => {
 
     const customer = req.user;
 
+    // Resolve the org for this pickup. Prefer the customer's orgId if set,
+    // otherwise derive it from the area / nearest area to the GPS location.
+    // This ensures admin-scoped history & stats see the pickup even when the
+    // customer self-signed-up without being assigned to an org.
+    let resolvedOrgId = customer.orgId || null;
+    if (!resolvedOrgId) {
+      resolvedOrgId = await resolveOrgIdForLocation({
+        latitude,
+        longitude,
+        area: area || null,
+      });
+    }
+
     // Run the driver-matching algorithm (now area-aware)
     const matched = await findBestDrivers({
       latitude: Number(latitude),
       longitude: Number(longitude),
       category: category || "non-recyclable",
       level: level || "easy",
-      orgId: customer.orgId,
+      orgId: resolvedOrgId,
       area: area || null,
     });
 
@@ -244,7 +300,7 @@ export const createPickup = async (req, res) => {
 
     const pickup = await PickupRequest.create({
       customerId: customer._id,
-      orgId: customer.orgId,
+      orgId: resolvedOrgId,
       wasteUploadId: wasteUploadId || null,
       location: { latitude, longitude, address: address || null },
       province: province || null,
@@ -300,6 +356,7 @@ export const createPickup = async (req, res) => {
       } else {
         io.to("drivers").emit("pickup:created", payload);
       }
+      io.to("admins").emit("pickup:created", payload);
     });
 
     return res.status(201).json({
@@ -392,6 +449,8 @@ export const getMyPickups = async (req, res) => {
   try {
     const { _id, role } = req.user;
     if (role !== "customer_admin") return res.status(403).json({ message: "Access denied" });
+
+    await expireStalePendingPickups({ customerId: _id });
 
     const pickups = await PickupRequest.find({ customerId: _id })
       .sort({ createdAt: -1 })
@@ -605,6 +664,7 @@ export const acceptPickup = async (req, res) => {
         driverName: driverInfo.name,
       });
       io.to("drivers").emit("pickup:accepted", { id: updated._id, status: "ASSIGNED", driverId: driverUser._id });
+      io.to("admins").emit("pickup:accepted", { id: updated._id, status: "ASSIGNED", driverId: driverUser._id });
     });
 
     return res.status(200).json({ message: "Pickup request accepted", pickup: payload });
@@ -691,6 +751,7 @@ export const cancelPickup = async (req, res) => {
       if (updated.driverId) {
         io.to(`driver:${updated.driverId}`).emit("pickup:cancelled", { id: updated._id });
       }
+      io.to("admins").emit("pickup:cancelled", { id: updated._id, status: "CANCELLED" });
     });
 
     return res.status(200).json({ message: "Pickup request cancelled", pickup: payload });
@@ -816,6 +877,13 @@ export const updatePickupStatus = async (req, res) => {
         pickupId: updated._id,
         status: newStatus,
         driverInfo: updated.driverInfo,
+      });
+      io.to("admins").emit("pickup:statusUpdate", {
+        id: updated._id,
+        pickupId: updated._id,
+        status: newStatus,
+        orgId: updated.orgId,
+        ...(newStatus === "COMPLETED" && { completedAt: updated.completedAt }),
       });
     });
 

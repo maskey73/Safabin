@@ -1,4 +1,6 @@
 import http from "http";
+import path from "path";
+import { fileURLToPath } from "url";
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -21,17 +23,27 @@ import notificationRoutes from "./routes/notification.route.js";
 import historyRoutes from "./routes/history.route.js";
 import pricingConfigRoutes from "./routes/pricingConfig.route.js";
 import paymentRoutes from "./routes/payment.route.js";
+import billingRoutes from "./routes/billing.route.js";
 import { cleanupExpiredUploads } from "./controllers/upload.controller.js";
 import { autoGenerateMLSchedule } from "./controllers/mlSchedule.controller.js";
+import { runBillGeneration } from "./controllers/billing.controller.js";
+import { ensurePickupRequestIndexes, expireStalePendingPickups } from "./services/pickupExpiry.js";
 import { initSocket } from "./socket/socketServer.js";
 
-dotenv.config();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+dotenv.config({ path: path.resolve(__dirname, "../.env") });
 
 // Single cron schedule guard so hot reload (e.g. nodemon) does not register multiple jobs
 let cleanupCronScheduled = false;
 let mlScheduleCronScheduled = false;
+let billingCronScheduled = false;
+let pickupExpiryCronScheduled = false;
 const CRON_SCHEDULE = "0 2 * * *"; // 2:00 AM every day (server local time)
+const PICKUP_EXPIRY_CRON = "*/1 * * * *"; // every minute
 const ML_SCHEDULE_CRON = "0 0 * * *"; // 12:00 AM (midnight) every day — generates today's schedule
+const BILLING_CRON = "0 3 1 * *"; // 3:00 AM on the 1st of every month — generate monthly bills
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -68,6 +80,7 @@ app.use("/api/notifications", notificationRoutes);
 app.use("/api/history", historyRoutes);
 app.use("/api/pricing-config", pricingConfigRoutes);
 app.use("/api/payments", paymentRoutes);
+app.use("/api/billing", billingRoutes);
 
 // Health check
 app.get("/", (req, res) => {
@@ -110,7 +123,7 @@ app.use((err, req, res, next) => {
 const server = http.createServer(app);
 initSocket(server); // attach Socket.IO to the same HTTP server
 
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
   console.log(
     `CORS enabled for: ${process.env.NODE_ENV === "production"
@@ -118,7 +131,13 @@ server.listen(PORT, () => {
       : "all origins (development)"
     }`
   );
-  connectDB();
+  try {
+    await connectDB();
+    await ensurePickupRequestIndexes();
+    await expireStalePendingPickups();
+  } catch (err) {
+    console.error("Startup database initialization failed:", err.message);
+  }
 
   if (!cleanupCronScheduled) {
     cleanupCronScheduled = true;
@@ -129,6 +148,17 @@ server.listen(PORT, () => {
             console.log(`Cleanup: removed ${r.deleted} expired waste upload(s), errors=${r.errors}`);
         })
         .catch((e) => console.error("Cleanup error:", e));
+    });
+  }
+
+  if (!pickupExpiryCronScheduled) {
+    pickupExpiryCronScheduled = true;
+    cron.schedule(PICKUP_EXPIRY_CRON, () => {
+      expireStalePendingPickups()
+        .then((r) => {
+          if (r.modified > 0) console.log(`Pickup expiry: marked ${r.modified} request(s) as EXPIRED`);
+        })
+        .catch((e) => console.error("Pickup expiry error:", e));
     });
   }
 
@@ -147,5 +177,17 @@ server.listen(PORT, () => {
         .then((r) => console.log(`ML startup schedule: ${r.message}`))
         .catch((e) => console.error("ML startup schedule error:", e));
     }, 5000);
+  }
+
+  if (!billingCronScheduled) {
+    billingCronScheduled = true;
+    cron.schedule(BILLING_CRON, () => {
+      runBillGeneration()
+        .then((r) => console.log(`Billing: ${r.message}`))
+        .catch((e) => console.error("Billing generation error:", e));
+    });
+
+    // Bills are created by the monthly cron above or explicit admin action.
+    // Avoid startup generation so restarts do not look like daily bill runs.
   }
 });

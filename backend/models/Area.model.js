@@ -50,6 +50,7 @@ areaSchema.pre("save", function (next) {
   next();
 });
 
+areaSchema.index({ name: 1 });
 areaSchema.index({ type: 1 });
 areaSchema.index({ orgId: 1 });
 
