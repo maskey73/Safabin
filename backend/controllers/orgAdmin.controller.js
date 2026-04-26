@@ -5,8 +5,137 @@ import Task from "../models/Task.model.js";
 import Organization from "../models/Organization.model.js";
 import DeletionRequest from "../models/DeletionRequest.model.js";
 import PickupRequest from "../models/PickupRequest.model.js";
+import Area from "../models/Area.model.js";
+import { buildPickupAnalytics, buildScheduleAnalytics } from "../services/pickupAnalytics.js";
 import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
+
+async function buildOrganizationDetail(orgId) {
+  const org = await Organization.findById(orgId)
+    .populate("admins", "name email phone isActive createdAt");
+
+  if (!org) return null;
+
+  const trucks = await Truck.find({ orgId: org._id }).lean();
+  const orgDriverUsers = await User.find({ orgId: org._id, role: "driver" })
+    .select("_id name email phone isActive createdAt")
+    .lean();
+  const driverUserIds = orgDriverUsers.map((u) => u._id);
+  const drivers = await Driver.find({ userId: { $in: driverUserIds } })
+    .populate("assignedTruckId", "licensePlate truckType capacity")
+    .lean();
+  const areas = await Area.find({ orgId: org._id, isActive: true }).lean();
+
+  const driversWithUser = drivers.map((driver) => {
+    const user = orgDriverUsers.find((u) => u._id.toString() === driver.userId.toString());
+    return {
+      id: driver._id,
+      userId: driver.userId,
+      name: user?.name || "Unknown",
+      email: user?.email || "",
+      phone: user?.phone || "",
+      isAvailable: driver.isAvailable,
+      assignedTruck: driver.assignedTruckId
+        ? {
+            id: driver.assignedTruckId._id,
+            licensePlate: driver.assignedTruckId.licensePlate,
+            truckType: driver.assignedTruckId.truckType,
+            capacity: driver.assignedTruckId.capacity,
+          }
+        : null,
+      createdAt: user?.createdAt,
+    };
+  });
+
+  const driverByTruck = {};
+  for (const driver of driversWithUser) {
+    if (driver.assignedTruck) {
+      driverByTruck[driver.assignedTruck.id.toString()] = {
+        name: driver.name,
+        id: driver.id,
+      };
+    }
+  }
+
+  const trucksFormatted = trucks.map((truck) => ({
+    id: truck._id,
+    licensePlate: truck.licensePlate,
+    truckType: truck.truckType,
+    capacity: truck.capacity,
+    dutyType: truck.dutyType,
+    isAvailable: truck.isAvailable,
+    assignedDriver: driverByTruck[truck._id.toString()] || null,
+    createdAt: truck.createdAt,
+  }));
+
+  const totalTrucks = trucks.length;
+  const totalDrivers = driversWithUser.length;
+  const trucksWithDrivers = trucksFormatted.filter((truck) => truck.assignedDriver).length;
+  const totalCapacity = trucks.reduce((sum, truck) => sum + (truck.capacity || 0), 0);
+
+  return {
+    _id: org._id,
+    name: org.name,
+    location: org.location,
+    createdAt: org.createdAt,
+    admins: org.admins,
+    trucks: trucksFormatted,
+    drivers: driversWithUser,
+    areas,
+    stats: {
+      totalAdmins: org.admins?.length || 0,
+      totalTrucks,
+      availableTrucks: trucks.filter((truck) => truck.isAvailable).length,
+      totalDrivers,
+      availableDrivers: driversWithUser.filter((driver) => driver.isAvailable).length,
+      trucksWithDrivers,
+      trucksWithoutDrivers: totalTrucks - trucksWithDrivers,
+      totalAreas: areas.length,
+      totalCapacity,
+    },
+  };
+}
+
+export const getMyOrganization = async (req, res) => {
+  try {
+    if (!req.user.orgId) {
+      return res.status(403).json({ message: "Organization ID required" });
+    }
+
+    const data = await buildOrganizationDetail(req.user.orgId);
+    if (!data) return res.status(404).json({ message: "Organization not found" });
+
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to fetch organization details", error: error.message });
+  }
+};
+
+export const updateMyOrganization = async (req, res) => {
+  try {
+    if (!req.user.orgId) {
+      return res.status(403).json({ message: "Organization ID required" });
+    }
+
+    const { name, location } = req.body;
+    const org = await Organization.findById(req.user.orgId);
+    if (!org) return res.status(404).json({ message: "Organization not found" });
+
+    if (name) org.name = name;
+    if (location) {
+      if (location.address !== undefined) org.location.address = location.address;
+      if (location.latitude !== undefined) org.location.latitude = location.latitude;
+      if (location.longitude !== undefined) org.location.longitude = location.longitude;
+    }
+
+    await org.save();
+    const data = await buildOrganizationDetail(req.user.orgId);
+
+    res.status(200).json({ success: true, message: "Organization updated", data });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to update organization", error: error.message });
+  }
+};
 
 export const getOrgAdmins = async (req, res) => {
   try {
@@ -100,8 +229,9 @@ export const updateOrgAdmin = async (req, res) => {
 };
 export const createAdmin = async (req, res) => {
   try {
-    const { name, email, password, contactInfo } = req.body;
-    const orgId = req.user.orgId;
+    const { name, email, phone, password, contactInfo, orgId: requestedOrgId } = req.body;
+    const isSuperAdmin = req.user.role === "super_admin";
+    const orgId = isSuperAdmin ? requestedOrgId : req.user.orgId;
 
     if (!orgId) {
       return res.status(403).json({ message: "Organization ID required" });
@@ -111,7 +241,16 @@ export const createAdmin = async (req, res) => {
       return res.status(400).json({ message: "Name, email, and password are required" });
     }
 
-    const existingUser = await User.findOne({ email });
+    if (!mongoose.isValidObjectId(orgId)) {
+      return res.status(400).json({ message: "Valid organization ID is required" });
+    }
+
+    const org = await Organization.findById(orgId);
+    if (!org) {
+      return res.status(404).json({ message: "Organization not found" });
+    }
+
+    const existingUser = await User.findOne({ email: email.toLowerCase() });
     if (existingUser) {
       return res.status(400).json({ message: "User already exists" });
     }
@@ -120,14 +259,19 @@ export const createAdmin = async (req, res) => {
 
     const admin = new User({
       name,
-      email,
+      email: email.toLowerCase(),
       passwordHash: hashedPassword,
-      contactInfo,
+      phone: phone || contactInfo || undefined,
       role: "admin",
       orgId
     });
 
     await admin.save();
+
+    if (!org.admins.some((id) => id.toString() === admin._id.toString())) {
+      org.admins.push(admin._id);
+      await org.save();
+    }
 
     res.status(201).json({
       message: "Admin created successfully",
@@ -135,6 +279,7 @@ export const createAdmin = async (req, res) => {
         id: admin._id,
         name: admin.name,
         email: admin.email,
+        phone: admin.phone || "",
         role: admin.role
       }
     });
@@ -497,141 +642,85 @@ export const getMyDeletionRequests = async (req, res) => {
 
 // ========== Admin Analytics ==========
 
+/**
+ * Org admin dashboard analytics — same shape as super-admin's, but scoped
+ * to the admin's organization. All numbers come from PickupRequest (the
+ * real source of truth) — the legacy Task-based aggregations were stale
+ * because Task is the ML scheduler's per-area record, not actual work.
+ *
+ * Reuses buildPickupAnalytics() from superAdmin.controller.js so both
+ * roles share one aggregation pipeline.
+ */
 export const getAdminAnalytics = async (req, res) => {
   try {
     const orgId = req.user.orgId;
     if (!orgId) return res.status(403).json({ message: "Organization ID required" });
 
     const orgIdObj = new mongoose.Types.ObjectId(orgId);
+    const match = { orgId: orgIdObj };
 
-    // 1. Ecosystem Stats
-    const totalDrivers = await User.countDocuments({ orgId, role: "driver" });
-    const activeVehicles = await Truck.countDocuments({ orgId, isAvailable: true });
-    
-    // Total Waste (sum of estimatedVolume from COMPLETED tasks)
-    const wasteAggregation = await Task.aggregate([
-      { $match: { orgId: orgIdObj, status: "COMPLETED" } },
-      { $group: { _id: null, totalWaste: { $sum: "$estimatedVolume" } } }
-    ]);
-    const totalWasteCollected = wasteAggregation.length > 0 ? wasteAggregation[0].totalWaste : 0;
-    
-    const activeRoutes = await Task.countDocuments({ 
-        orgId, 
-        status: { $in: ["ASSIGNED", "IN_PROGRESS"] } 
-    });
-
-    // 2. Driver Performance
-    const driverStats = await Task.aggregate([
-      { $match: { orgId: orgIdObj, status: "COMPLETED", assignedDriverId: { $ne: null } } },
-      { 
-        $group: { 
-          _id: "$assignedDriverId", 
-          wasteCollected: { $sum: "$estimatedVolume" },
-          completedTasks: { $sum: 1 } 
-        } 
-      }
-    ]);
-
-    // Populate driver names
-    const driverData = await Promise.all(driverStats.map(async stat => {
-      const driver = await Driver.findById(stat._id).populate("userId", "name");
-      return {
-        _id: stat._id,
-        name: driver?.userId?.name || "Unknown Driver",
-        wasteCollectedField: stat.wasteCollected,
-        activeVehicles: 1, // Dummy data so Scatter chart doesn't break
-        routes: stat.completedTasks
-      };
-    }));
-
-    // 3. Time Series Data (Last 7 days)
-    const sevenDaysAgo = new Date();
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-    
-    const timeSeriesAggregation = await Task.aggregate([
-      { $match: { orgId: orgIdObj, status: "COMPLETED", completedAt: { $gte: sevenDaysAgo } } },
-      {
-        $group: {
-          _id: { $dateToString: { format: "%Y-%m-%d", date: "$completedAt" } },
-          dailyWaste: { $sum: "$estimatedVolume" }
-        }
-      },
-      {
-        $project: {
-          date: "$_id",
-          dailyWaste: 1,
-          _id: 0
-        }
-      },
-      { $sort: { date: 1 } }
-    ]);
-
-    const org = await Organization.findById(orgId);
-    const timeSeriesDataRaw = timeSeriesAggregation.map(item => ({
-      ...item,
-      orgName: org?.name || "Organization"
-    }));
-
-    // 4. Waste Type Breakdown
-    const wasteTypeDistribution = await Task.aggregate([
-      { $match: { orgId: orgIdObj, status: "COMPLETED" } },
-      { $group: { _id: "$wasteType", amount: { $sum: "$estimatedVolume" } } }
-    ]);
-
-    // 5. Task Status Distribution
-    const taskStatusDistribution = await Task.aggregate([
-      { $match: { orgId: orgIdObj } },
-      { $group: { _id: "$status", count: { $sum: 1 } } }
-    ]);
-
-    // 6. Pickup stats for this org
-    const pickupStatusAgg = await PickupRequest.aggregate([
-      { $match: { orgId: orgIdObj } },
-      { $group: { _id: "$status", count: { $sum: 1 } } },
-    ]);
-    const pickupStatusMap = {};
-    let totalPickups = 0;
-    for (const s of pickupStatusAgg) {
-      pickupStatusMap[s._id] = s.count;
-      totalPickups += s.count;
-    }
-
-    const pickupTrend = await PickupRequest.aggregate([
-      { $match: { orgId: orgIdObj, createdAt: { $gte: sevenDaysAgo } } },
-      {
-        $group: {
-          _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-          total: { $sum: 1 },
-          completed: { $sum: { $cond: [{ $eq: ["$status", "COMPLETED"] }, 1, 0] } },
+    const [totalDrivers, activeVehicles, pickupAnalytics, scheduleAnalytics, areaBreakdown] = await Promise.all([
+      User.countDocuments({ orgId, role: "driver" }),
+      Truck.countDocuments({ orgId, isAvailable: true }),
+      buildPickupAnalytics(match),
+      buildScheduleAnalytics({ orgId }),
+      // Per-area pickup breakdown — replaces the old Task-based driver chart
+      PickupRequest.aggregate([
+        { $match: { ...match, area: { $ne: null } } },
+        {
+          $group: {
+            _id: "$area",
+            total: { $sum: 1 },
+            completed: { $sum: { $cond: [{ $eq: ["$status", "COMPLETED"] }, 1, 0] } },
+            revenue: {
+              $sum: { $cond: [{ $eq: ["$status", "COMPLETED"] }, { $ifNull: ["$estimatedPrice", 0] }, 0] },
+            },
+          },
         },
-      },
-      { $sort: { _id: 1 } },
+        { $sort: { total: -1 } },
+        { $limit: 15 },
+        {
+          $project: {
+            name: "$_id",
+            total: 1,
+            completed: 1,
+            revenue: { $round: ["$revenue", 0] },
+            _id: 0,
+          },
+        },
+      ]),
     ]);
 
     res.status(200).json({
       success: true,
       data: {
+        // Headline cards (Dashboard.jsx reads these — note totalOrganizations
+        // is repurposed as totalDrivers for the admin role; the frontend
+        // already labels it correctly based on role).
         ecosystemStats: {
           totalOrganizations: totalDrivers,
-          totalWasteCollected,
           activeVehicles,
-          activeRoutes,
-          totalPickups,
-          completedPickups: pickupStatusMap.COMPLETED || 0,
-          activePickups: (pickupStatusMap.PENDING || 0) + (pickupStatusMap.ASSIGNED || 0) +
-            (pickupStatusMap.EN_ROUTE || 0) + (pickupStatusMap.ARRIVED || 0) + (pickupStatusMap.COLLECTING || 0),
+          totalPickups: pickupAnalytics.summary.total,
+          completedPickups: pickupAnalytics.summary.completed,
+          activePickups: pickupAnalytics.summary.active,
+          cancelledPickups: pickupAnalytics.summary.cancelled,
+          completionRate: pickupAnalytics.summary.completionRate,
+          totalRevenue: pickupAnalytics.summary.totalRevenue,
+          avgResponseMs: pickupAnalytics.summary.avgResponseMs,
+          avgTaskDurationMs: pickupAnalytics.summary.avgTaskDurationMs,
         },
-        organizationData: driverData,
-        timeSeriesDataRaw,
-        wasteTypeDistribution,
-        taskStatusDistribution,
-        pickupStats: {
-          statusDistribution: pickupStatusAgg.map(s => ({ status: s._id, count: s.count })),
-          dailyTrend: pickupTrend.map(d => ({ date: d._id, total: d.total, completed: d.completed })),
-        },
-      }
+        // Charts
+        statusDistribution: pickupAnalytics.statusDistribution,
+        categoryDistribution: pickupAnalytics.categoryDistribution,
+        levelDistribution: pickupAnalytics.levelDistribution,
+        dailyTrend: pickupAnalytics.dailyTrend,
+        hourlyDistribution: pickupAnalytics.hourlyDistribution,
+        topDrivers: pickupAnalytics.topDrivers,
+        scheduleAnalytics,
+        // Per-area breakdown (admin view)
+        areaBreakdown,
+      },
     });
-
   } catch (error) {
     console.error("Error generating admin analytics:", error);
     res.status(500).json({ success: false, message: "Failed to generate analytics", error: error.message });
