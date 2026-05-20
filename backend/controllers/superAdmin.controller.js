@@ -6,6 +6,7 @@ import Driver from "../models/Driver.model.js";
 import PickupRequest from "../models/PickupRequest.model.js";
 import { buildPickupAnalytics, buildScheduleAnalytics } from "../services/pickupAnalytics.js";
 import DeletionRequest from "../models/DeletionRequest.model.js";
+import { getIO } from "../socket/socketServer.js";
 import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
 
@@ -243,7 +244,13 @@ export const getSuperAdminAnalytics = async (req, res) => {
             total: { $sum: 1 },
             completed: { $sum: { $cond: [{ $eq: ["$status", "COMPLETED"] }, 1, 0] } },
             revenue: {
-              $sum: { $cond: [{ $eq: ["$status", "COMPLETED"] }, { $ifNull: ["$estimatedPrice", 0] }, 0] },
+              $sum: {
+                $cond: [
+                  { $and: [{ $eq: ["$status", "COMPLETED"] }, { $eq: ["$paymentStatus", "PAID"] }] },
+                  { $ifNull: ["$estimatedPrice", 0] },
+                  0,
+                ],
+              },
             },
           },
         },
@@ -293,6 +300,7 @@ export const getSuperAdminAnalytics = async (req, res) => {
         categoryDistribution: pickupAnalytics.categoryDistribution,
         levelDistribution: pickupAnalytics.levelDistribution,
         dailyTrend: pickupAnalytics.dailyTrend,
+        monthlyRevenue: pickupAnalytics.monthlyRevenue,
         hourlyDistribution: pickupAnalytics.hourlyDistribution,
         topDrivers: pickupAnalytics.topDrivers,
         scheduleAnalytics,
@@ -353,10 +361,10 @@ export const getAllVehicles = async (req, res) => {
 
 export const createVehicle = async (req, res) => {
   try {
-    const { truckType, capacity, licensePlate, orgId } = req.body;
+    const { truckType = "MIXED", capacity, licensePlate, orgId } = req.body;
 
-    if (!truckType || !capacity || !licensePlate || !orgId) {
-      return res.status(400).json({ message: "truckType, capacity, licensePlate, and orgId are required" });
+    if (!capacity || !licensePlate || !orgId) {
+      return res.status(400).json({ message: "capacity, licensePlate, and orgId are required" });
     }
 
     const org = await Organization.findById(orgId);
@@ -649,6 +657,18 @@ export const reviewDeletionRequest = async (req, res) => {
           if (driver.userId) await User.findByIdAndDelete(driver.userId);
         }
       }
+    }
+
+    try {
+      const totalPending = await DeletionRequest.countDocuments({ status: "pending" });
+      const orgPending = await DeletionRequest.countDocuments({ orgId: request.orgId, status: "pending" });
+      const io = getIO();
+      io.to("super_admins").emit("deletion-request:counts", { deletions: totalPending });
+      if (request.orgId) {
+        io.to(`org:${request.orgId}`).emit("deletion-request:counts", { deletions: orgPending });
+      }
+    } catch (socketErr) {
+      console.error("Socket error on deletion request review emission:", socketErr.message);
     }
 
     res.status(200).json({ success: true, message: `Request ${action}` });
