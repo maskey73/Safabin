@@ -25,6 +25,7 @@ export async function buildPickupAnalytics(match) {
     categoryAgg,
     levelAgg,
     dailyAgg,
+    monthlyRevenueAgg,
     hourlyAgg,
     topDriversAgg,
   ] = await Promise.all([
@@ -46,7 +47,13 @@ export async function buildPickupAnalytics(match) {
             },
           },
           totalRevenue: {
-            $sum: { $cond: [{ $eq: ["$status", "COMPLETED"] }, { $ifNull: ["$estimatedPrice", 0] }, 0] },
+            $sum: {
+              $cond: [
+                { $and: [{ $eq: ["$status", "COMPLETED"] }, { $eq: ["$paymentStatus", "PAID"] }] },
+                { $ifNull: ["$estimatedPrice", 0] },
+                0,
+              ],
+            },
           },
           avgResponseMs: {
             $avg: { $cond: [{ $ne: ["$responseTimeMs", null] }, "$responseTimeMs", "$$REMOVE"] },
@@ -87,13 +94,27 @@ export async function buildPickupAnalytics(match) {
     ]),
 
     PickupRequest.aggregate([
+      { $match: { ...match, status: "COMPLETED", paymentStatus: "PAID" } },
+      {
+        $group: {
+          _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } },
+          revenue: { $sum: { $ifNull: ["$estimatedPrice", 0] } },
+          completed: { $sum: 1 },
+        },
+      },
+      { $sort: { _id: -1 } },
+      { $limit: 12 },
+      { $sort: { _id: 1 } },
+    ]),
+
+    PickupRequest.aggregate([
       { $match: match },
       { $group: { _id: { $hour: "$createdAt" }, count: { $sum: 1 } } },
       { $sort: { _id: 1 } },
     ]),
 
     PickupRequest.aggregate([
-      { $match: { ...match, status: "COMPLETED", driverId: { $ne: null } } },
+      { $match: { ...match, status: "COMPLETED", paymentStatus: "PAID", driverId: { $ne: null } } },
       {
         $group: {
           _id: "$driverId",
@@ -158,6 +179,11 @@ export async function buildPickupAnalytics(match) {
       created: d.created,
       completed: d.completed,
       cancelled: d.cancelled,
+    })),
+    monthlyRevenue: monthlyRevenueAgg.map((d) => ({
+      month: d._id,
+      revenue: Math.round(d.revenue || 0),
+      completed: d.completed,
     })),
     hourlyDistribution: hourlyAgg.map((h) => ({ hour: h._id, count: h.count })),
     topDrivers: topDriversAgg,
