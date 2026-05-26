@@ -1,6 +1,6 @@
 # Advance Waste Management System Nepal - Smart Waste Management Platform
 
-This system is a full-stack waste-management system for Nepal-focused municipal and organizational waste collection. It combines customer pickup requests, driver task flow, admin fleet management, real-time Socket.IO updates, monthly billing, eSewa/cash payments, Cloudinary waste uploads, and a Python ML service that predicts area-wise waste volume and generates daily truck dispatch schedules.
+This system is a full-stack waste-management system for Nepal-focused municipal and organizational waste collection. It combines customer pickup requests, driver task flow, admin fleet management, real-time Socket.IO updates, monthly billing, eSewa/cash payments, Cloudinary waste uploads, and a Python ML service that predicts area-wise waste volume and generates daily truck dispatch schedules
 
 The project is split into three running apps:
 
@@ -19,9 +19,12 @@ maskey-1/
 - [Roles and Access](#roles-and-access)
 - [Repository Tour](#repository-tour)
 - [Setup](#setup)
+- [Quick Start for Developers](#quick-start-for-developers)
 - [Dependency Guide](#dependency-guide)
 - [Environment Variables](#environment-variables)
 - [How to Run](#how-to-run)
+- [How to Work With the Codebase](#how-to-work-with-the-codebase)
+- [How to Test](#how-to-test)
 - [Quality Gates, CI, and Tests](#quality-gates-ci-and-tests)
 - [Core Workflows](#core-workflows)
 - [ML Scheduling](#ml-scheduling)
@@ -253,7 +256,7 @@ Frontend `package.json` scripts:
 - Cloudinary account for image uploads
 - Optional: eSewa merchant/sandbox credentials
 - Optional: OpenRouteService API key
-- Optional: SMTP account for real OTP email
+- Optional: SMTP mailbox for local OTP email and/or Brevo account with a verified sender for hosted OTP email
 
 ### Install Node Dependencies
 
@@ -282,6 +285,79 @@ python train.py
 
 `train.py` loads `ml/data/kathmandu_waste_data.csv`. If the CSV does not exist, it generates synthetic Kathmandu Valley data first.
 
+## Quick Start for Developers
+
+For day-to-day local development, use this shortest reliable path:
+
+```bash
+npm install
+cd frontend
+npm install
+cd ..
+```
+
+Create local environment files:
+
+```bash
+copy .env.example .env
+copy ml\.env.example ml\.env
+```
+
+Then edit `.env` so these values agree with the ports you actually use:
+
+```env
+PORT=5000
+BACKEND_URL=http://localhost:5000
+FRONTEND_URL=http://localhost:5173
+ML_SERVICE_URL=http://localhost:8000
+MONGO_URL=mongodb://localhost:27017/maskey
+```
+
+Start the app in three terminals:
+
+```bash
+# Terminal 1: backend API
+npm run dev
+
+# Terminal 2: frontend app
+cd frontend
+npm run dev
+
+# Terminal 3: ML service
+cd ml
+.venv\Scripts\activate
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Open the frontend at:
+
+```text
+http://localhost:5173
+```
+
+Useful health checks:
+
+```text
+http://localhost:5000/api/health
+http://localhost:8000/health
+```
+
+Before opening a pull request, run the same checks CI runs:
+
+```bash
+npm test
+npm run lint:frontend
+npm run build:frontend
+```
+
+On Windows PowerShell, if `npm` is blocked by the local script execution policy, use `npm.cmd` instead:
+
+```bash
+npm.cmd test
+npm.cmd run lint:frontend
+npm.cmd run build:frontend
+```
+
 ## Dependency Guide
 
 This section explains what every declared package is doing in this project. Version numbers are controlled by the package files and lockfiles; the explanations here focus on purpose.
@@ -306,7 +382,7 @@ These packages are declared in the root `package.json` and are used mainly by th
 | `mongoose` | MongoDB object modeling library. Defines schemas, models, indexes, queries, and document updates. |
 | `multer` | Handles multipart form uploads. In this project it receives waste image files before streaming them to Cloudinary. |
 | `node-cron` | Runs scheduled background jobs such as upload cleanup, pickup expiry, ML schedule generation, and monthly billing. |
-| `nodemailer` | Sends OTP and notification emails through SMTP. |
+| `nodemailer` | Sends OTP emails through SMTP when using the local development mail configuration. |
 | `nodemon` | Development server watcher. Restarts the backend when files change. |
 | `socket.io` | Realtime backend server for pickup dispatch, status updates, admin notifications, and driver/customer rooms. |
 | `streamifier` | Converts upload buffers into readable streams, which is useful for streaming Multer memory uploads into Cloudinary. |
@@ -416,13 +492,18 @@ CRON_SECRET=your-cron-secret
 METRICS_SECRET=your-metrics-secret
 
 # OTP email
+# Local development: SMTP is used when Brevo values are empty
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=your-email@gmail.com
 SMTP_PASS=your-app-password
-FROM_EMAIL=noreply@safabin.com
-EMAIL_USER=your-email@gmail.com
-EMAIL_PASS=your-app-password
+FROM_EMAIL=your-email@gmail.com
+
+# Production/Render: Brevo API is used when these values are configured
+BREVO_API_KEY=
+BREVO_SENDER_EMAIL=
+BREVO_SENDER_NAME=Safabin Nepal
+BREVO_TIMEOUT_MS=10000
 
 # Routes
 ORS_API_KEY=your-openrouteservice-key
@@ -473,13 +554,15 @@ Notes:
 | `CLOUDINARY_API_SECRET` | Yes for uploads | Cloudinary API secret. |
 | `CRON_SECRET` | Recommended | Protects manual cron cleanup endpoint when set. |
 | `METRICS_SECRET` | Optional | Protects the metrics endpoint when set. |
-| `SMTP_HOST` | Yes for email | SMTP server hostname. |
-| `SMTP_PORT` | Yes for email | SMTP server port, commonly `587`. |
-| `SMTP_USER` | Yes for email | SMTP username. |
-| `SMTP_PASS` | Yes for email | SMTP password or app password. |
-| `FROM_EMAIL` | Yes for email | Sender address shown on OTP/support emails. |
-| `EMAIL_USER` | Legacy/optional | Older email helper credential key. Prefer SMTP keys where possible. |
-| `EMAIL_PASS` | Legacy/optional | Older email helper password key. Prefer SMTP keys where possible. |
+| `SMTP_HOST` | Yes for local SMTP email | Development SMTP server hostname. Ignored when Brevo values are configured. |
+| `SMTP_PORT` | No | Development SMTP port. Defaults to `587`. |
+| `SMTP_USER` | Yes for local SMTP email | Development SMTP username. |
+| `SMTP_PASS` | Yes for local SMTP email | Development SMTP password or app password. |
+| `FROM_EMAIL` | No | SMTP sender address. Defaults to `SMTP_USER`. |
+| `BREVO_API_KEY` | Yes for hosted email | Brevo transactional email API key. When configured with `BREVO_SENDER_EMAIL`, Brevo is used instead of SMTP. |
+| `BREVO_SENDER_EMAIL` | Yes for hosted email | Email address verified as a sender in Brevo, including a verified Gmail address for testing. |
+| `BREVO_SENDER_NAME` | No | Sender name shown on OTP emails. Defaults to `Safabin Nepal`. |
+| `BREVO_TIMEOUT_MS` | No | Timeout for Brevo API email requests. Defaults to `10000`. |
 | `ORS_API_KEY` | Optional | OpenRouteService key for road distance routing. Without it, pickup estimate can fall back to haversine distance. |
 | `ESEWA_PRODUCT_CODE` | Yes for eSewa | eSewa merchant/product code. |
 | `ESEWA_SECRET_KEY` | Yes for eSewa | Secret used to sign and verify eSewa payloads. |
@@ -547,6 +630,148 @@ ML health:
 ```http
 GET http://localhost:8000/health
 ```
+
+## How to Work With the Codebase
+
+Use the project as three related apps that run together:
+
+| Area | Where to work | What to change there |
+| --- | --- | --- |
+| Backend API | `backend/` | Express routes, controllers, services, domain modules, Mongoose models, auth, sockets, jobs, and tests. |
+| Frontend app | `frontend/` | React pages, reusable components, Zustand stores, API helpers, routes, styling, and frontend build/lint fixes. |
+| ML service | `ml/` | FastAPI endpoints, prediction logic, scheduling logic, training data, and model training files. |
+| Seeds/scripts | `scripts/` and `backend/scripts/` | Local data setup, backfills, and one-off maintenance scripts. |
+
+Recommended development flow:
+
+1. Pull the latest code and install dependencies with `npm install` at the root and inside `frontend/`.
+2. Copy `.env.example` to `.env`, then update MongoDB, port, Cloudinary, eSewa, email-provider, and ML values for your machine.
+3. Run backend, frontend, and ML service in separate terminals.
+4. Make backend API changes together with focused tests under `backend/tests/` or the related `backend/domains/**/tests/` folder when present.
+5. Make frontend changes through stores and API helpers instead of calling `fetch` directly from page components.
+6. Keep role behavior in mind. Check customer, driver, admin, and super-admin flows when touching shared auth, billing, pickup, or dashboard logic.
+7. Run `npm test`, `npm run lint:frontend`, and `npm run build:frontend` before pushing.
+
+Backend conventions:
+
+- `backend/app.js` builds the Express app and is test-friendly.
+- `backend/server.js` starts MongoDB, HTTP, Socket.IO, and cron jobs.
+- Older features live in `routes/`, `controllers/`, `services/`, and `models/`.
+- Newer features live under `domains/` with route, controller, service, repository, policy, validation, and test files kept closer together.
+- Use `authMiddleware` and `roleMiddleware(...)` for protected routes.
+- Keep organization scoping explicit for admin routes and user ownership checks explicit for customer/driver routes.
+
+Frontend conventions:
+
+- Add or update API calls in `frontend/src/utils/` or the relevant Zustand store in `frontend/src/stores/`.
+- Keep page components focused on layout and composition.
+- Put reusable UI in `frontend/src/components/`.
+- Use `VITE_API_BASE_URL` and `VITE_API_URL` consistently in `frontend/.env`.
+- Run `npm run lint` inside `frontend/` while working on UI changes.
+
+ML conventions:
+
+- Run the ML service from the `ml/` directory so relative model/data paths resolve correctly.
+- If `ml/models/*.pkl` files are missing or stale, run `python train.py` from `ml/`.
+- Keep backend persistence in the backend. The ML service should return predictions and schedule suggestions; the backend stores accepted schedules in MongoDB.
+
+## How to Test
+
+### Full Local Check
+
+Run this from the repository root before pushing:
+
+```bash
+npm test
+npm run lint:frontend
+npm run build:frontend
+```
+
+On Windows PowerShell, use `npm.cmd test`, `npm.cmd run lint:frontend`, and `npm.cmd run build:frontend` if the shell blocks `npm.ps1`.
+
+These commands match the main CI checks:
+
+| Command | What it verifies |
+| --- | --- |
+| `npm test` | Backend and domain tests using Node's built-in test runner. |
+| `npm run lint:frontend` | Frontend ESLint with zero warnings allowed. |
+| `npm run build:frontend` | Production Vite build for the React app. |
+
+### Backend Tests
+
+Run all backend tests:
+
+```bash
+npm test
+```
+
+Run one test file:
+
+```bash
+node --test backend/tests/pickupLifecycle.test.js
+```
+
+Current backend tests include:
+
+| Test file | Coverage focus |
+| --- | --- |
+| `backend/tests/appArchitecture.test.js` | App structure, route wiring, and import safety. |
+| `backend/tests/authBillingSecurity.test.js` | Auth, billing, payment, and security-sensitive behavior. |
+| `backend/tests/knapsackOptimization.test.js` | Scheduling optimization behavior. |
+| `backend/tests/pickupLifecycle.test.js` | On-demand pickup lifecycle and driver/customer flow. |
+
+Add backend tests when changing:
+
+- auth or role checks
+- pickup creation, dispatch, acceptance, completion, cancellation, or expiry
+- billing or payment logic
+- organization scoping
+- schedule generation or assignment
+- shared middleware, validators, or response helpers
+
+### Frontend Checks
+
+Run frontend lint directly:
+
+```bash
+cd frontend
+npm run lint -- --max-warnings=0
+```
+
+Run the production build directly:
+
+```bash
+cd frontend
+npm run build
+```
+
+Preview the built frontend:
+
+```bash
+cd frontend
+npm run preview
+```
+
+The frontend currently has lint/build checks but no dedicated unit test script. For UI changes, verify the affected route manually in the browser and run the lint/build commands above.
+
+### ML Service Checks
+
+There is no dedicated ML test script in `ml/` yet. Use these smoke checks after changing prediction or scheduling code:
+
+```bash
+cd ml
+.venv\Scripts\activate
+python train.py
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Then confirm:
+
+```text
+GET http://localhost:8000/health
+```
+
+If the backend depends on the ML change, also start the backend and test the admin schedule flow that calls `ML_SERVICE_URL`.
 
 ## Quality Gates, CI, and Tests
 
@@ -639,7 +864,7 @@ What it does:
 node --test
 ```
 
-The backend tests are intentionally lightweight and mostly stub external dependencies. They do not need a real MongoDB, Cloudinary account, eSewa account, SMTP server, OpenRouteService key, or ML service for the covered cases.
+The backend tests are intentionally lightweight and mostly stub external dependencies. They do not need a real MongoDB, Cloudinary account, eSewa account, SMTP mailbox, Brevo API key, OpenRouteService key, or ML service for the covered cases.
 
 #### Frontend job
 
@@ -1331,7 +1556,138 @@ Driver:
 3. Opens route/task page.
 4. Moves through task statuses.
 5. Completes pickup.
-6. If cash, marks cash collected after completion.
+6. If cash, marks cash collected during collection before completion.
+
+### Pickup Flow Diagram
+
+This is the full on-demand flow from the customer screen to driver completion:
+
+```mermaid
+flowchart TD
+  A["Customer opens Upload Waste / Schedule Pickup"] --> B{"Use waste image?"}
+  B -->|Yes| C["Upload image as field image"]
+  C --> D["Backend stores image in Cloudinary"]
+  D --> E["WasteUpload record stores URL, category, level, expiry"]
+  B -->|No| F["Customer selects category and level manually"]
+  E --> G["Customer chooses location and service area"]
+  F --> G
+  G --> H["POST /api/pickups/estimate"]
+  H --> I["Backend resolves area and organization"]
+  I --> J["Backend calculates depot-to-customer distance"]
+  J --> K["Backend returns route and price estimate"]
+  K --> L["POST /api/pickups creates draft"]
+  L --> M["PickupRequest status PAYMENT_REQUIRED"]
+  M --> N{"Payment method"}
+  N -->|Cash| O["POST /api/payments/initiate records cash intent"]
+  O --> P["Pickup status becomes PENDING"]
+  N -->|eSewa| Q["POST /api/payments/initiate returns signed eSewa payload"]
+  Q --> R["Customer completes eSewa checkout"]
+  R --> S["eSewa callback verifies signature, amount, and status"]
+  S --> P
+  P --> T["Backend matches eligible drivers"]
+  T --> U["Socket.IO dispatches pickup to driver rooms"]
+  U --> V["Driver accepts pickup"]
+  V --> W["Pickup status ASSIGNED"]
+  W --> X["Driver follows route and status steps"]
+  X --> Y{"Cash pickup?"}
+  Y -->|Yes| Z["Driver marks cash collected"]
+  Z --> AA["Driver completes pickup"]
+  Y -->|No| AA
+  AA --> AB["Pickup retained for history, analytics, and audit"]
+```
+
+### Sequence Diagram
+
+```mermaid
+sequenceDiagram
+  actor Customer
+  participant Frontend
+  participant API as Express API
+  participant Cloudinary
+  participant MongoDB
+  participant ORS as OpenRouteService
+  participant Esewa as eSewa
+  participant Socket as Socket.IO
+  actor Driver
+
+  opt Customer uploads a waste image
+    Customer->>Frontend: Select image, category, and level
+    Frontend->>API: POST /api/user/upload-waste
+    API->>Cloudinary: Upload image
+    API->>MongoDB: Save WasteUpload metadata
+    API-->>Frontend: Return image URL and upload id
+  end
+
+  Customer->>Frontend: Choose pickup location and area
+  Frontend->>API: POST /api/pickups/estimate
+  API->>MongoDB: Load Area, Organization, PricingConfig
+  API->>ORS: Request road distance
+  ORS-->>API: Route distance or failure
+  API-->>Frontend: Price and route estimate
+
+  Customer->>Frontend: Confirm pickup
+  Frontend->>API: POST /api/pickups
+  API->>MongoDB: Create PickupRequest as PAYMENT_REQUIRED
+  API-->>Frontend: Pickup draft
+
+  alt Cash
+    Customer->>Frontend: Select cash
+    Frontend->>API: POST /api/payments/initiate
+    API->>MongoDB: Create pending cash Payment
+    API->>MongoDB: Move pickup to PENDING
+  else eSewa
+    Customer->>Frontend: Select eSewa
+    Frontend->>API: POST /api/payments/initiate
+    API-->>Frontend: Signed eSewa checkout payload
+    Frontend->>Esewa: Redirect customer to checkout
+    Esewa->>API: Success callback
+    API->>Esewa: Verify transaction status
+    API->>MongoDB: Mark payment paid and pickup PENDING
+  end
+
+  API->>MongoDB: Match available drivers and trucks
+  API->>Socket: Emit pickup notification
+  Socket-->>Driver: Realtime pickup request
+  Driver->>API: POST /api/pickups/:id/accept
+  API->>MongoDB: Assign driver and reserve availability
+  API->>Socket: Notify customer/admins
+
+  Driver->>API: POST /api/pickups/:id/status EN_ROUTE
+  Driver->>API: POST /api/pickups/:id/status ARRIVED
+  Driver->>API: POST /api/pickups/:id/status COLLECTING
+  opt Cash pickup
+    Driver->>API: POST /api/payments/:pickupId/cash-collected
+    API->>MongoDB: Mark cash payment collected
+  end
+  Driver->>API: POST /api/pickups/:id/status COMPLETED
+  API->>MongoDB: Store completion and audit events
+```
+
+### Image Upload Flow
+
+Images are optional for the modern pickup request. When a customer uploads one, it is handled before or alongside pickup creation and the returned URL can be shown in the UI/history.
+
+```mermaid
+flowchart LR
+  A["Customer selects JPEG, PNG, or WebP"] --> B["Frontend sends multipart form-data"]
+  B --> C["POST /api/user/upload-waste"]
+  C --> D["Multer validates field image"]
+  D --> E["Cloudinary stores file under waste_uploads/userId"]
+  E --> F["WasteUpload saves URL, publicId, category, level"]
+  F --> G["Upload expires after 30 days"]
+  G --> H["Cleanup job deletes expired Cloudinary asset and DB record"]
+```
+
+Image upload rules:
+
+- Route: `POST /api/user/upload-waste`
+- Role: `customer_admin`
+- Form field name: `image`
+- Supported formats: JPEG, PNG, WebP
+- Max size: 5 MB
+- Storage: Cloudinary folder `waste_uploads/<userId>/`
+- Metadata model: `WasteUpload`
+- Retention: 30 days, then cleanup job removes expired uploads
 
 ### Pickup Estimate
 
@@ -1476,7 +1832,7 @@ Pickup payments are stored in `Payment`.
 
 | Method | How it works |
 | --- | --- |
-| `cash` | Creates a pending cash payment, changes pickup to `PENDING`, dispatches to drivers, and driver marks cash collected after pickup is complete. |
+| `cash` | Creates a pending cash payment, changes pickup to `PENDING`, dispatches to drivers, and driver marks cash collected during collection before completing the pickup. |
 | `esewa` | Creates signed eSewa form fields. Pickup dispatches only after eSewa callback signature and status API verification succeed. |
 
 ### eSewa Security
@@ -1494,13 +1850,13 @@ Pickup payment callback routes are intentionally unauthenticated because eSewa c
 
 ### Cash Pickup Rule
 
-Drivers cannot mark cash collected before pickup completion.
+Drivers must mark cash collected before completing a cash pickup.
 
 Required:
 
 - Pickup assigned to that driver.
 - `paymentMethod = cash`
-- `status = COMPLETED`
+- Pickup has reached the collection step.
 - Payment row status still `PENDING`
 
 ## Monthly Billing
@@ -2147,7 +2503,7 @@ Use these carefully against the intended MongoDB database.
 - Use a strong `JWT_SECRET`.
 - Set `NODE_ENV=production`.
 - Restrict CORS with `FRONTEND_URL`.
-- Use real SMTP or SMS provider.
+- Use a real transactional email or SMS provider.
 - Use production eSewa credentials/base URL.
 - Set `BACKEND_URL` to public backend URL for callbacks.
 - Set Cloudinary credentials.

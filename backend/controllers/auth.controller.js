@@ -4,6 +4,24 @@ import bcrypt from "bcryptjs";
 import { generateOTP, hashOTP, verifyOTP as verifyOTPHash, isOTPExpired, getOTPExpiration, canResendOTP, isAttemptLimitExceeded } from "../utils/otp.utils.js";
 import { sendOTPEmail, sendOTPSMS } from "../services/emailService.js";
 import { ROLES } from "../utils/roles.js";
+import { logger, reportError } from "../utils/observability.js";
+
+function maskContact(value = "") {
+  if (!value) return undefined;
+  const [name, domain] = String(value).split("@");
+  if (!domain) return `${String(value).slice(0, 2)}***`;
+  return `${name.slice(0, 2)}***@${domain}`;
+}
+
+async function dispatchOTP({ email, phone, otpCode }) {
+  if (email) {
+    await sendOTPEmail(email, otpCode);
+    return "email";
+  }
+
+  await sendOTPSMS(phone, otpCode);
+  return "sms";
+}
 
 export const register = async (req, res) => {
   try {
@@ -60,8 +78,17 @@ export const register = async (req, res) => {
       } else if (phone) {
         await sendOTPSMS(phone, otpCode);
       }
+      logger.info("Registration OTP dispatched", {
+        channel: email ? "email" : "sms",
+        contact: maskContact(email || phone),
+      });
     } catch (sendError) {
-      console.error("Error sending OTP:", sendError);
+      reportError(sendError, {
+        source: "otp",
+        message: "Registration OTP dispatch failed",
+        channel: email ? "email" : "sms",
+        contact: maskContact(email || phone),
+      });
       // We continue even if sending fails, user can request resend
     }
 
@@ -131,6 +158,12 @@ export const login = async (req, res) => {
 export const requestOTP = async (req, res) => {
   try {
     const { email, phone } = req.body;
+    const contact = email || phone;
+
+    logger.info("OTP request received", {
+      channel: email ? "email" : "sms",
+      contact: maskContact(contact),
+    });
 
     if (!email && !phone) {
       return res.status(400).json({ message: "Email or phone is required" });
@@ -154,6 +187,10 @@ export const requestOTP = async (req, res) => {
 
     // If user doesn't exist, return error (Login flow)
     if (!user) {
+      logger.warn("OTP request user not found", {
+        channel: email ? "email" : "sms",
+        contact: maskContact(contact),
+      });
       return res.status(404).json({ message: "User not found. Please sign up first." });
     }
 
@@ -161,8 +198,13 @@ export const requestOTP = async (req, res) => {
     if (user.loginOtp?.lastSentAt) {
       if (!canResendOTP(user.loginOtp.lastSentAt, 60)) {
         const remainingSeconds = Math.ceil(60 - (new Date() - new Date(user.loginOtp.lastSentAt)) / 1000);
-        return res.status(429).json({
-          message: "Please wait before requesting a new OTP",
+        logger.warn("OTP request rejected by resend cooldown", {
+          userId: user._id,
+          retryAfter: remainingSeconds,
+        });
+        return res.status(200).json({
+          message: "A verification code was already sent. Please check your email.",
+          alreadySent: true,
           retryAfter: remainingSeconds
         });
       }
@@ -173,31 +215,42 @@ export const requestOTP = async (req, res) => {
     const hashedOTP = hashOTP(otpCode);
     const expiresAt = getOTPExpiration();
 
-    // Update user's OTP data
+    // Send OTP via email or SMS
+    try {
+      await dispatchOTP({ email, phone, otpCode });
+      logger.info("OTP dispatched", {
+        userId: user._id,
+        channel: email ? "email" : "sms",
+        contact: maskContact(contact),
+      });
+    } catch (sendError) {
+      reportError(sendError, {
+        source: "otp",
+        message: "OTP dispatch failed",
+        userId: user._id,
+        channel: email ? "email" : "sms",
+        contact: maskContact(contact),
+      });
+      if (process.env.NODE_ENV !== "development") {
+        return res.status(502).json({
+          message: `Failed to send OTP ${email ? "email" : "SMS"}. Please try again later.`,
+        });
+      }
+    }
+
     user.loginOtp = {
       hash: hashedOTP,
-      expiresAt: expiresAt,
+      expiresAt,
       attempts: 0,
       lastSentAt: new Date()
     };
 
     await user.save();
 
-    // Send OTP via email or SMS
-    try {
-      if (email) {
-        await sendOTPEmail(email, otpCode);
-      } else if (phone) {
-        await sendOTPSMS(phone, otpCode);
-      }
-    } catch (sendError) {
-      console.error("Error sending OTP:", sendError);
-      // Don't fail the request if email/SMS fails in dev mode
-      // In production, you might want to fail here
-    }
-
     res.status(200).json({
-      message: "OTP sent successfully",
+      message: process.env.NODE_ENV === "development"
+        ? "OTP generated. Email/SMS delivery may be unavailable in development."
+        : "OTP sent successfully",
       // In production, don't send OTP in response. Only for development/testing
       ...(process.env.NODE_ENV === 'development' && { otp: otpCode })
     });

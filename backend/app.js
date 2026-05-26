@@ -23,19 +23,50 @@ import pricingConfigRoutes from "./routes/pricingConfig.route.js";
 import paymentRoutes from "./routes/payment.route.js";
 import billingRoutes from "./routes/billing.route.js";
 import { cleanupExpiredUploads } from "./controllers/upload.controller.js";
-import { metrics, reportError, requestObservability } from "./utils/observability.js";
+import { logger, metrics, reportError, requestObservability } from "./utils/observability.js";
 import { apiResponseMiddleware, sendError, sendSuccess } from "./utils/apiResponse.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.resolve(__dirname, "../.env"), quiet: true });
 
+function normalizeOrigin(origin) {
+  return origin?.trim().replace(/\/+$/, "");
+}
+
+function parseOrigins(value = "") {
+  return value
+    .split(",")
+    .map(normalizeOrigin)
+    .filter(Boolean);
+}
+
+function getAllowedOrigins() {
+  const origins = [
+    ...parseOrigins(process.env.FRONTEND_URL || "http://localhost:5173"),
+    ...parseOrigins(process.env.CORS_ALLOWED_ORIGINS),
+  ];
+
+  return [...new Set(origins)];
+}
+
 export function createApp() {
   const app = express();
+  const allowedOrigins = getAllowedOrigins();
 
   const corsOptions = {
     origin: process.env.NODE_ENV === "production"
-      ? (process.env.FRONTEND_URL || "http://localhost:5173")
+      ? (origin, callback) => {
+          if (!origin || allowedOrigins.includes(normalizeOrigin(origin))) {
+            return callback(null, true);
+          }
+          logger.warn("CORS origin rejected", {
+            origin,
+            normalizedOrigin: normalizeOrigin(origin),
+            allowedOrigins,
+          });
+          return callback(null, false);
+        }
       : true,
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
