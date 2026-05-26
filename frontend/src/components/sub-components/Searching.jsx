@@ -7,7 +7,7 @@ import ThankYouPage from "./ThankYouPage";
 import { getSocket } from "../../utils/socket";
 import usePickupStore from "../../stores/usePickupStore";
 import usePaymentStore from "../../stores/usePaymentStore";
-import SearchingBg from "../../assets/ourteam.png";
+import SearchingBg from "../../assets/ourteam.webp";
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 delete L.Icon.Default.prototype._getIconUrl;
@@ -67,6 +67,7 @@ function MapSearchBar({ onLocationSelect, disabled }) {
   const [showResults, setShowResults] = useState(false);
   const wrapperRef = useRef(null);
   const debounceRef = useRef(null);
+  const searchControllerRef = useRef(null);
 
   useEffect(() => {
     const handler = (e) => {
@@ -79,21 +80,35 @@ function MapSearchBar({ onLocationSelect, disabled }) {
   const handleChange = useCallback((val) => {
     setQuery(val);
     if (debounceRef.current) clearTimeout(debounceRef.current);
+    searchControllerRef.current?.abort();
     if (val.length < 3) { setResults([]); setShowResults(false); return; }
 
     debounceRef.current = setTimeout(async () => {
+      const controller = new AbortController();
+      searchControllerRef.current = controller;
       setSearching(true);
       try {
         const res = await fetch(
           `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(val)}&countrycodes=np&limit=6&addressdetails=1`,
-          { headers: { "Accept-Language": "en" } }
+          { headers: { "Accept-Language": "en" }, signal: controller.signal }
         );
         const data = await res.json();
         setResults(data);
         setShowResults(data.length > 0);
-      } catch { setResults([]); }
-      finally { setSearching(false); }
+      } catch (error) {
+        if (error?.name !== "AbortError") setResults([]);
+      }
+      finally {
+        if (!controller.signal.aborted) setSearching(false);
+      }
     }, 400);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      searchControllerRef.current?.abort();
+    };
   }, []);
 
   const selectResult = (r) => {
@@ -396,6 +411,7 @@ function SearchPage() {
       } else if (["PENDING", "ASSIGNED", "EN_ROUTE", "ARRIVED", "COLLECTING"].includes(pickup.status)) {
         setPaymentSettled(true);
         paymentSettledRef.current = true;
+        if (pickup.status !== "PENDING") setSecondsLeft(60);
         setFlow(pickup.status === "PENDING" ? "searching" : "found");
         setDriverInfo(pickup.driverInfo || null);
         setAssignedAt(pickup.assignedAt || null);
@@ -409,8 +425,8 @@ function SearchPage() {
 
   useEffect(() => {
     if (flow !== "found") { clearInterval(intervalRef.current); return; }
-    setSecondsLeft(60);
     intervalRef.current = setInterval(() => {
+      if (document.visibilityState === "hidden") return;
       setSecondsLeft((s) => { if (s <= 1) { clearInterval(intervalRef.current); return 0; } return s - 1; });
     }, 1000);
     return () => clearInterval(intervalRef.current);
@@ -449,13 +465,13 @@ function SearchPage() {
   }, []);
 
   // Socket
-  const [taskStatus, setTaskStatus] = useState(null);
   useEffect(() => {
     const socket = getSocket();
     const onAccepted = (data) => {
       if (pickupId && data.id?.toString() !== pickupId?.toString()) return;
       setDriverInfo(data.driverInfo || null);
       setAssignedAt(data.assignedAt || null);
+      setSecondsLeft(60);
       setFlow("found");
     };
     const onStatus = (data) => {
@@ -467,7 +483,6 @@ function SearchPage() {
     };
     const onStatusUpdate = (data) => {
       if (pickupId && data.id?.toString() !== pickupId?.toString()) return;
-      setTaskStatus(data.status);
       if (data.status === "COMPLETED") {
         clearPickupResume();
         setFlow("thankyou");

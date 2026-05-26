@@ -1,6 +1,9 @@
 import PickupRequest from "../models/PickupRequest.model.js";
 import PickupEvent from "../models/PickupEvent.model.js";
+import Driver from "../models/Driver.model.js";
 import { getIO } from "../socket/socketServer.js";
+import { invalidateDashboardCache } from "./dashboardCache.js";
+import { refreshPickupDailySummaries } from "./pickupAnalytics.js";
 
 /**
  * Remove the old TTL index on PickupRequest.expiresAt. TTL indexes delete
@@ -29,6 +32,43 @@ export async function ensurePickupRequestIndexes() {
   if (!hasLookupIndex) {
     await collection.createIndex({ expiresAt: 1 }, { name: "expiresAt_1" });
   }
+
+  const requiredIndexes = [
+    [{ status: 1, createdAt: -1 }, { name: "status_1_createdAt_-1" }],
+    [{ driverId: 1, status: 1 }, { name: "driverId_1_status_1" }],
+    [{ orgId: 1, status: 1, createdAt: -1 }, { name: "orgId_1_status_1_createdAt_-1" }],
+    [{ customerId: 1, createdAt: -1 }, { name: "customerId_1_createdAt_-1" }],
+    [{ orgId: 1, createdAt: -1 }, { name: "orgId_1_createdAt_-1" }],
+    [{ driverId: 1, createdAt: -1 }, { name: "driverId_1_createdAt_-1" }],
+    [{ paymentStatus: 1, createdAt: -1 }, { name: "paymentStatus_1_createdAt_-1" }],
+    [{ orgId: 1, paymentStatus: 1, createdAt: -1 }, { name: "orgId_1_paymentStatus_1_createdAt_-1" }],
+    [{ paymentMethod: 1, paymentStatus: 1, createdAt: -1 }, { name: "paymentMethod_1_paymentStatus_1_createdAt_-1" }],
+  ];
+
+  for (const [key, options] of requiredIndexes) {
+    await collection.createIndex(key, options);
+  }
+}
+
+function activePickupFilter(driverUserId) {
+  return {
+    driverId: driverUserId,
+    status: { $in: ["ASSIGNED", "EN_ROUTE", "ARRIVED", "COLLECTING"] },
+  };
+}
+
+async function releaseDriverIfNoActivePickup(driverUserId) {
+  if (!driverUserId) return false;
+  const activePickup = await PickupRequest.findOne(activePickupFilter(driverUserId))
+    .select("_id")
+    .lean();
+  if (activePickup) return false;
+
+  await Driver.updateOne(
+    { userId: driverUserId },
+    { $set: { isAvailable: true, updatedAt: new Date() } }
+  );
+  return true;
 }
 
 export async function expireStalePendingPickups({ customerId = null } = {}) {
@@ -40,7 +80,7 @@ export async function expireStalePendingPickups({ customerId = null } = {}) {
   };
 
   const stalePickups = await PickupRequest.find(filter)
-    .select("_id customerId")
+    .select("_id customerId driverId")
     .lean();
 
   if (stalePickups.length === 0) {
@@ -66,6 +106,15 @@ export async function expireStalePendingPickups({ customerId = null } = {}) {
 
   const modifiedCount = result.modifiedCount || 0;
   if (modifiedCount > 0) {
+    const driverIds = [
+      ...new Set(stalePickups.map((pickup) => pickup.driverId?.toString()).filter(Boolean)),
+    ];
+    await Promise.all(driverIds.map((driverId) => releaseDriverIfNoActivePickup(driverId)));
+    invalidateDashboardCache();
+    refreshPickupDailySummaries().catch((err) => {
+      console.error("[PickupAnalytics] Failed to refresh daily summaries after expiry:", err.message);
+    });
+
     await PickupEvent.insertMany(
       stalePickups.map((pickup) => ({
         pickupId: pickup._id,

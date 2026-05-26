@@ -1,27 +1,29 @@
 import { create } from 'zustand';
-import axios from 'axios';
-import useAuthStore from './useAuthStore';
-
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001/api';
+import api from '../utils/api';
 
 const useAdminStore = create((set, get) => ({
   admins: [],
   orgName: "",
   orgGroups: null,
+  pagination: null,
   isLoading: false,
   error: null,
+  lastParams: { page: 1, limit: 10 },
 
-  fetchAdmins: async () => {
+  fetchAdmins: async (params = {}) => {
+    const nextParams = { ...get().lastParams, ...params, limit: params.limit || 10 };
     set({ isLoading: true, error: null });
     try {
-      const token = useAuthStore.getState().token;
-      const res = await axios.get(`${API_URL}/org-admin/admins`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const query = new URLSearchParams();
+      if (nextParams.page) query.set("page", nextParams.page);
+      if (nextParams.limit) query.set("limit", nextParams.limit);
+      const res = await api.get(`/org-admin/admins?${query.toString()}`);
       set({
         admins: res.data.data,
         orgName: res.data.orgName || "",
         orgGroups: res.data.orgGroups || null,
+        pagination: res.data.pagination || null,
+        lastParams: nextParams,
         isLoading: false
       });
     } catch (error) {
@@ -31,11 +33,8 @@ const useAdminStore = create((set, get) => ({
 
   createAdmin: async (data) => {
     try {
-      const token = useAuthStore.getState().token;
-      await axios.post(`${API_URL}/org-admin/admins`, data, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      get().fetchAdmins();
+      await api.post('/org-admin/admins', data);
+      get().fetchAdmins({ page: 1 });
       return { success: true };
     } catch (error) {
       return { success: false, error: error.response?.data?.message || 'Failed to create admin' };
@@ -44,10 +43,7 @@ const useAdminStore = create((set, get) => ({
 
   updateAdmin: async (adminId, data) => {
     try {
-      const token = useAuthStore.getState().token;
-      await axios.put(`${API_URL}/org-admin/admins/${adminId}`, data, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      await api.put(`/org-admin/admins/${adminId}`, data);
       get().fetchAdmins();
       return { success: true };
     } catch (error) {
@@ -57,10 +53,7 @@ const useAdminStore = create((set, get) => ({
 
   deleteAdmin: async (adminId) => {
     try {
-      const token = useAuthStore.getState().token;
-      await axios.delete(`${API_URL}/super-admin/admins/${adminId}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      await api.delete(`/super-admin/admins/${adminId}`);
       get().fetchAdmins();
       return { success: true };
     } catch (error) {

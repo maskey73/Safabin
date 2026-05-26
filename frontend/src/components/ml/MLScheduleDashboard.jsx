@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import useAuthStore from "../../stores/useAuthStore";
 import useMLScheduleStore from "../../stores/useMLScheduleStore";
+import api from "../../utils/api";
 import AreaPredictionCard from "./AreaPredictionCard";
 
 const STATUS_STYLES = {
@@ -47,6 +48,13 @@ const formatDate = (date) =>
 
 const formatNumber = (value) =>
   Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 0 });
+
+const getLocalDateString = (date = new Date()) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
 
 const StatCard = ({ label, value, detail, tone = "default" }) => (
   <div className="rounded-lg border border-primary/10 bg-white p-4">
@@ -146,14 +154,13 @@ const MLScheduleDashboard = () => {
   const user = useAuthStore((s) => s.user);
   const isSuperAdmin = user?.role === "super_admin";
 
-  const [selectedDate, setSelectedDate] = useState(() => new Date().toISOString().split("T")[0]);
+  const [selectedDate, setSelectedDate] = useState(() => getLocalDateString());
   const [showGenerator, setShowGenerator] = useState(false);
   const [previewSchedule, setPreviewSchedule] = useState(null);
 
   const loadTodaySchedule = useCallback(async (date) => {
     try {
-      const response = await import("../../utils/api").then((m) => m.default);
-      const res = await response.get(`/ml-schedule?date=${date}&limit=1`);
+      const res = await api.get(`/ml-schedule?date=${date}&limit=1`);
       const todaySchedules = res.data.data || [];
       if (todaySchedules.length > 0) {
         useMLScheduleStore.setState({ currentSchedule: todaySchedules[0], schedules: todaySchedules });
@@ -167,7 +174,7 @@ const MLScheduleDashboard = () => {
 
   useEffect(() => {
     checkMLHealth();
-    loadTodaySchedule(new Date().toISOString().split("T")[0]);
+    loadTodaySchedule(getLocalDateString());
   }, [checkMLHealth, loadTodaySchedule]);
 
   const displaySchedule = currentSchedule;
@@ -193,7 +200,7 @@ const MLScheduleDashboard = () => {
     const result = await generateSchedule(selectedDate);
     if (!result) return;
 
-    const today = new Date().toISOString().split("T")[0];
+    const today = getLocalDateString();
     if (selectedDate === today) {
       setPreviewSchedule(null);
     } else {

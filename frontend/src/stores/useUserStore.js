@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import api from "../utils/api";
+import { isAbortError } from "../utils/requests";
 
 const useUserStore = create((set, get) => ({
   users: [],
@@ -16,9 +17,11 @@ const useUserStore = create((set, get) => ({
       if (params.role) query.set("role", params.role);
       if (params.status) query.set("status", params.status);
       if (params.page) query.set("page", params.page);
-      if (params.limit) query.set("limit", params.limit);
+      query.set("limit", params.limit || 10);
 
-      const res = await api.get(`/super-admin/users?${query.toString()}`);
+      const res = await api.get(`/super-admin/users?${query.toString()}`, {
+        signal: params.signal,
+      });
       set({
         users: res.data.users,
         stats: res.data.stats,
@@ -26,6 +29,7 @@ const useUserStore = create((set, get) => ({
         isLoading: false,
       });
     } catch (err) {
+      if (isAbortError(err)) return;
       set({
         isLoading: false,
         error: err.response?.data?.message || "Failed to fetch users",
@@ -33,7 +37,16 @@ const useUserStore = create((set, get) => ({
     }
   },
 
-  updateUser: async (userId, data) => {
+  updateUser: async (userId, data, options = {}) => {
+    let previousUsers = null;
+    if (options.optimistic) {
+      previousUsers = get().users;
+      set((state) => ({
+        users: state.users.map((u) =>
+          u.id === userId ? { ...u, ...data } : u
+        ),
+      }));
+    }
     try {
       const res = await api.put(`/super-admin/users/${userId}`, data);
       if (res.data.success) {
@@ -45,8 +58,10 @@ const useUserStore = create((set, get) => ({
         }));
         return { success: true };
       }
+      if (previousUsers) set({ users: previousUsers });
       return { success: false, error: res.data.message };
     } catch (err) {
+      if (previousUsers) set({ users: previousUsers });
       return {
         success: false,
         error: err.response?.data?.message || "Failed to update user",

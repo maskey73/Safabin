@@ -2,7 +2,9 @@ import mongoose from "mongoose";
 import Payment from "../models/Payment.model.js";
 import PickupRequest from "../models/PickupRequest.model.js";
 import User from "../models/User.model.js";
-import { emitPickupToDrivers } from "./pickup.controller.js";
+import { computePickupPricingAndRoute, emitPickupToDrivers } from "../services/pickup.service.js";
+import { invalidateDashboardCache } from "../services/dashboardCache.js";
+import { refreshPickupDailySummaryForDate } from "../services/pickupAnalytics.js";
 import {
   buildEsewaInitiationPayload,
   decodeAndVerifyCallback,
@@ -16,18 +18,28 @@ import {
  * Security rules enforced here
  * ────────────────────────────
  *  - The customer can only initiate payment for a pickup THEY own.
- *  - The amount is ALWAYS read from the database (PickupRequest.estimatedPrice),
- *    never from the request body.
+ *  - The amount is recomputed from the pickup's server-side location, org/depot,
+ *    category, and level before charging; never from the request body.
  *  - eSewa callbacks are verified twice: signature check + status API.
  *  - Idempotency: a Payment moves from PENDING → COMPLETED via an atomic
  *    findOneAndUpdate guarded by `status: "PENDING"`. Duplicate callbacks
  *    are no-ops.
- *  - Cash payments can only be marked PAID by the assigned driver, and only
- *    once the pickup is COMPLETED.
+ *  - Cash payments can only be marked PAID by the assigned driver during
+ *    collection or completion.
  *  - Admin/super_admin can read but not silently mutate payment status.
  */
 
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+
+function sameId(a, b) {
+  return a != null && b != null && a.toString() === b.toString();
+}
+
+function adminCanAccessPickup(pickup, user) {
+  if (user.role === "super_admin") return true;
+  if (user.role !== "admin") return false;
+  return sameId(pickup.orgId, user.orgId);
+}
 
 function paymentPayload(p) {
   if (!p) return null;
@@ -49,6 +61,13 @@ function paymentPayload(p) {
   };
 }
 
+function invalidatePaymentAnalytics(date = new Date()) {
+  invalidateDashboardCache();
+  refreshPickupDailySummaryForDate(date).catch((err) => {
+    console.error("[PickupAnalytics] Failed to refresh daily summary:", err.message);
+  });
+}
+
 // ── POST /api/payments/initiate ───────────────────────────────────────────
 /**
  * Customer chooses how they want to pay for an existing pickup.
@@ -60,10 +79,61 @@ function paymentPayload(p) {
  *  - esewa: creates a Payment row, returns the SIGNED form fields the
  *           browser must POST to eSewa to start the hosted checkout.
  */
-async function dispatchPickupAfterPaymentChoice(pickup) {
+const DISPATCHABLE_PAYMENT_STATUSES = ["PAYMENT_REQUIRED", "PENDING"];
+
+function pickupMatchesPayment(pickup, payment) {
+  return (
+    payment &&
+    DISPATCHABLE_PAYMENT_STATUSES.includes(pickup.status) &&
+    pickup.paymentMethod === payment.method &&
+    pickup.paymentId?.toString() === payment._id.toString()
+  );
+}
+
+function activePickupPaymentFilter(payment) {
+  return {
+    _id: payment.pickupId,
+    paymentMethod: payment.method,
+    paymentId: payment._id,
+  };
+}
+
+async function updateActivePickupPaymentStatus(payment, paymentStatus) {
+  const pickup = await PickupRequest.findOneAndUpdate(
+    activePickupPaymentFilter(payment),
+    { $set: { paymentStatus } },
+    { new: true }
+  );
+  if (pickup) invalidatePaymentAnalytics(pickup.createdAt);
+  return !!pickup;
+}
+
+async function cancelSupersededEsewaAttempts(pickupId, activePaymentId) {
+  await Payment.updateMany(
+    {
+      pickupId,
+      method: "esewa",
+      status: "PENDING",
+      _id: { $ne: activePaymentId },
+    },
+    {
+      $set: {
+        status: "CANCELLED",
+        failedAt: new Date(),
+        failureReason: "Superseded by a newer eSewa payment attempt",
+      },
+    }
+  );
+}
+
+async function dispatchPickupAfterPaymentChoice(pickup, payment) {
+  if (!pickupMatchesPayment(pickup, payment)) {
+    return false;
+  }
+
   const previousStatus = pickup.status;
 
-  if (pickup.status !== "PENDING") {
+  if (pickup.status === "PAYMENT_REQUIRED") {
     pickup.status = "PENDING";
     pickup.expiresAt = new Date(Date.now() + 10 * 60 * 1000);
     pickup.statusHistory.push({
@@ -78,6 +148,7 @@ async function dispatchPickupAfterPaymentChoice(pickup) {
 
   const customer = await User.findById(pickup.customerId).select("name").lean();
   emitPickupToDrivers(pickup, customer?.name || null);
+  return true;
 }
 
 export const initiatePayment = async (req, res) => {
@@ -104,7 +175,25 @@ export const initiatePayment = async (req, res) => {
       return res.status(409).json({ message: "This pickup is already paid" });
     }
 
-    // 3. Trust ONLY the server-side amount
+    // 3. Recompute price and route before charging. Legacy drafts may contain
+    // client-supplied estimates, so the database value is refreshed here.
+    const quote = await computePickupPricingAndRoute({
+      latitude: pickup.location.latitude,
+      longitude: pickup.location.longitude,
+      category: pickup.category,
+      level: pickup.level,
+      area: pickup.area,
+      orgId: pickup.orgId,
+    });
+    pickup.orgId = quote.orgId;
+    pickup.estimatedPrice = quote.pricing.estimatedPrice;
+    pickup.currency = quote.pricing.currency;
+    pickup.priceBreakdown = quote.pricing.priceBreakdown;
+    pickup.routeDistanceKm = quote.route.distanceKm;
+    pickup.routeDurationMinutes = quote.route.durationMinutes;
+    pickup.routeGeometry = quote.route.geometry;
+    pickup.depotLocation = quote.depotLocation;
+
     const amount = Number(pickup.estimatedPrice);
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({
@@ -128,13 +217,18 @@ export const initiatePayment = async (req, res) => {
           method: "cash",
           status: "PENDING",
         });
+      } else if (payment.amount !== amount || payment.currency !== (pickup.currency || "NPR")) {
+        payment.amount = amount;
+        payment.currency = pickup.currency || "NPR";
+        await payment.save();
       }
 
       pickup.paymentMethod = "cash";
       pickup.paymentStatus = "PENDING";
       pickup.paymentId = payment._id;
       await pickup.save();
-      await dispatchPickupAfterPaymentChoice(pickup);
+      invalidatePaymentAnalytics(pickup.createdAt);
+      await dispatchPickupAfterPaymentChoice(pickup, payment);
 
       return res.status(200).json({
         success: true,
@@ -171,6 +265,8 @@ export const initiatePayment = async (req, res) => {
     pickup.paymentStatus = "PENDING";
     pickup.paymentId = payment._id;
     await pickup.save();
+    invalidatePaymentAnalytics(pickup.createdAt);
+    await cancelSupersededEsewaAttempts(pickup._id, payment._id);
 
     return res.status(200).json({
       success: true,
@@ -181,9 +277,9 @@ export const initiatePayment = async (req, res) => {
     });
   } catch (err) {
     console.error("initiatePayment error:", err);
-    return res.status(500).json({
-      message: "Failed to initiate payment",
-      ...(process.env.NODE_ENV === "development" && { error: err.message }),
+    return res.status(err.statusCode || 500).json({
+      message: err.statusCode ? err.message : "Failed to initiate payment",
+      ...(!err.statusCode && process.env.NODE_ENV === "development" && { error: err.message }),
     });
   }
 };
@@ -231,7 +327,46 @@ export const esewaSuccess = async (req, res) => {
       );
     }
 
-    // 3. Confirm the amount matches what we expect (defends against tampering)
+    const pickup = await PickupRequest.findById(payment.pickupId);
+    if (!pickup) {
+      return res.redirect(`${FRONTEND_URL}/payment-failed?reason=pickup_not_found`);
+    }
+
+    const quote = await computePickupPricingAndRoute({
+      latitude: pickup.location.latitude,
+      longitude: pickup.location.longitude,
+      category: pickup.category,
+      level: pickup.level,
+      area: pickup.area,
+      orgId: pickup.orgId,
+    });
+    const expectedAmount = Number(quote.pricing.estimatedPrice);
+    pickup.orgId = quote.orgId;
+    pickup.estimatedPrice = quote.pricing.estimatedPrice;
+    pickup.currency = quote.pricing.currency;
+    pickup.priceBreakdown = quote.pricing.priceBreakdown;
+    pickup.routeDistanceKm = quote.route.distanceKm;
+    pickup.routeDurationMinutes = quote.route.durationMinutes;
+    pickup.routeGeometry = quote.route.geometry;
+    pickup.depotLocation = quote.depotLocation;
+
+    if (!Number.isFinite(expectedAmount) || payment.amount !== expectedAmount) {
+      console.warn(
+        `[esewa] stored amount mismatch for ${transactionUuid}: expected ${expectedAmount}, got ${payment.amount}`
+      );
+      await Payment.updateOne(
+        { _id: payment._id, status: "PENDING" },
+        {
+          status: "FAILED",
+          failedAt: new Date(),
+          failureReason: "Stored payment amount did not match recomputed pickup price",
+        }
+      );
+      await updateActivePickupPaymentStatus(payment, "FAILED");
+      return res.redirect(`${FRONTEND_URL}/payment-failed?reason=amount_mismatch`);
+    }
+
+    // 3. Confirm the callback amount matches what we expect (defends against tampering)
     const callbackAmount = Number(String(totalAmountStr).replace(/,/g, ""));
     if (!Number.isFinite(callbackAmount) || callbackAmount !== payment.amount) {
       console.warn(
@@ -263,10 +398,7 @@ export const esewaSuccess = async (req, res) => {
           failureReason: `eSewa status: ${statusResp?.status}`,
         }
       );
-      await PickupRequest.updateOne(
-        { _id: payment.pickupId },
-        { paymentStatus: "FAILED" }
-      );
+      await updateActivePickupPaymentStatus(payment, "FAILED");
       return res.redirect(`${FRONTEND_URL}/payment-failed?reason=not_complete`);
     }
 
@@ -283,11 +415,26 @@ export const esewaSuccess = async (req, res) => {
     );
 
     if (updated) {
-      const pickup = await PickupRequest.findById(payment.pickupId);
-      if (pickup) {
-        pickup.paymentStatus = "PAID";
-        await pickup.save();
-        await dispatchPickupAfterPaymentChoice(pickup);
+      const activePickup = await PickupRequest.findOneAndUpdate(
+        activePickupPaymentFilter(updated),
+        {
+          $set: {
+            paymentStatus: "PAID",
+            orgId: pickup.orgId,
+            estimatedPrice: pickup.estimatedPrice,
+            currency: pickup.currency,
+            priceBreakdown: pickup.priceBreakdown,
+            routeDistanceKm: pickup.routeDistanceKm,
+            routeDurationMinutes: pickup.routeDurationMinutes,
+            routeGeometry: pickup.routeGeometry,
+            depotLocation: pickup.depotLocation,
+          },
+        },
+        { new: true }
+      );
+      if (activePickup) {
+        invalidatePaymentAnalytics(activePickup.createdAt);
+        await dispatchPickupAfterPaymentChoice(activePickup, updated);
       }
     }
 
@@ -318,10 +465,9 @@ export const esewaFailure = async (req, res) => {
           { new: true }
         );
         if (payment) {
-          await PickupRequest.updateOne(
-            { _id: payment.pickupId },
-            { paymentStatus: "FAILED" }
-          );
+          await updateActivePickupPaymentStatus(payment, "FAILED");
+          const pickup = await PickupRequest.findById(payment.pickupId).select("createdAt").lean();
+          invalidatePaymentAnalytics(pickup?.createdAt);
         }
       } catch {
         // Signature failure — ignore silently, do not mutate state
@@ -339,7 +485,7 @@ export const esewaFailure = async (req, res) => {
  * Driver marks a CASH payment as collected.
  *
  *  - Only the assigned driver may call this
- *  - Pickup must be COMPLETED (you cannot collect cash before the job is done)
+ *  - Pickup must be in COLLECTING or COMPLETED state
  *  - Method must be cash
  *  - Atomic transition PENDING → COMPLETED
  */
@@ -361,8 +507,8 @@ export const markCashCollected = async (req, res) => {
     if (pickup.paymentMethod !== "cash") {
       return res.status(400).json({ message: "Pickup is not a cash payment" });
     }
-    if (pickup.status !== "COMPLETED") {
-      return res.status(400).json({ message: "Pickup must be COMPLETED before collecting cash" });
+    if (!["COLLECTING", "COMPLETED"].includes(pickup.status)) {
+      return res.status(400).json({ message: "Pickup must be in collection before collecting cash" });
     }
     if (pickup.paymentStatus === "PAID") {
       return res.status(200).json({ success: true, message: "Already settled" });
@@ -385,6 +531,7 @@ export const markCashCollected = async (req, res) => {
 
     pickup.paymentStatus = "PAID";
     await pickup.save();
+    invalidatePaymentAnalytics(pickup.createdAt);
 
     return res.status(200).json({ success: true, payment: paymentPayload(payment) });
   } catch (err) {
@@ -406,11 +553,11 @@ export const getPaymentByPickup = async (req, res) => {
     );
     if (!pickup) return res.status(404).json({ message: "Pickup not found" });
 
-    const { _id, role } = req.user;
+    const { _id } = req.user;
     const isOwner = pickup.customerId.toString() === _id.toString();
     const isAssignedDriver =
       pickup.driverId && pickup.driverId.toString() === _id.toString();
-    const isAdmin = role === "admin" || role === "super_admin";
+    const isAdmin = adminCanAccessPickup(pickup, req.user);
 
     if (!isOwner && !isAssignedDriver && !isAdmin) {
       return res.status(403).json({ message: "Access denied" });
@@ -428,24 +575,66 @@ export const getPaymentByPickup = async (req, res) => {
 export const getAllPayments = async (req, res) => {
   try {
     const { method, status, limit = 100 } = req.query;
+    const { role, orgId } = req.user;
     const filter = {};
     if (method) filter.method = method;
     if (status) filter.status = status;
+    const maxLimit = Math.min(Number(limit) || 100, 500);
 
-    const payments = await Payment.find(filter)
-      .sort({ createdAt: -1 })
-      .limit(Math.min(Number(limit) || 100, 500))
-      .lean();
+    const scopedStages = [];
+    if (role === "admin") {
+      if (!orgId || !mongoose.isValidObjectId(orgId)) {
+        return res.status(403).json({ message: "Organization ID required" });
+      }
 
-    const totals = await Payment.aggregate([
-      { $match: { status: "COMPLETED" } },
-      {
-        $group: {
-          _id: "$method",
-          total: { $sum: "$amount" },
-          count: { $sum: 1 },
+      const orgObjectId = new mongoose.Types.ObjectId(orgId);
+      scopedStages.push(
+        {
+          $lookup: {
+            from: "pickuprequests",
+            localField: "pickupId",
+            foreignField: "_id",
+            as: "pickup",
+          },
         },
-      },
+        {
+          $lookup: {
+            from: "users",
+            localField: "customerId",
+            foreignField: "_id",
+            as: "customer",
+          },
+        },
+        {
+          $match: {
+            $or: [
+              { "pickup.orgId": orgObjectId },
+              { "customer.orgId": orgObjectId },
+            ],
+          },
+        },
+        { $project: { pickup: 0, customer: 0 } }
+      );
+    }
+
+    const [payments, totals] = await Promise.all([
+      Payment.aggregate([
+        { $match: filter },
+        ...scopedStages,
+        { $sort: { createdAt: -1 } },
+        { $limit: maxLimit },
+      ]),
+      Payment.aggregate([
+        { $match: { status: "COMPLETED" } },
+        ...scopedStages,
+        {
+          $group: {
+            _id: "$method",
+            total: { $sum: "$amount" },
+            count: { $sum: 1 },
+          },
+        },
+      ]),
     ]);
 
     return res.status(200).json({

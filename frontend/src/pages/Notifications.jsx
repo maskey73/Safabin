@@ -1,11 +1,12 @@
-import React, { useState, useEffect, useCallback } from "react";
-import axios from "axios";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
+import api from "../utils/api";
 import useAuthStore from "../stores/useAuthStore";
 import { getSocket } from "../utils/socket";
+import { isAbortError } from "../utils/requests";
 import DeletionRequests from "./DeletionRequests";
 import { Bell, AlertTriangle, CheckCircle, Info, Truck, User, Ban, RotateCcw, Clock, CheckCheck, Filter, RefreshCw } from "lucide-react";
-
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5001/api";
+import PaginationControls from "../components/shared/PaginationControls";
+import { AdminEmptyState, AdminErrorState, ListSkeleton } from "../components/shared/AdminListStates";
 
 const SEVERITY_CONFIG = {
   critical: { border: "border-l-red-500", bg: "bg-red-50/60", badge: "bg-red-100 text-red-700", icon: <AlertTriangle className="w-5 h-5 text-red-500" /> },
@@ -23,13 +24,17 @@ const TYPE_ICONS = {
 };
 
 const Notifications = () => {
-  const { token, user } = useAuthStore();
+  const { user } = useAuthStore();
   const [activeTab, setActiveTab] = useState("alerts");
   const [messages, setMessages] = useState([]);
   const [systemAlerts, setSystemAlerts] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [filterSeverity, setFilterSeverity] = useState("all");
+  const [alertsPage, setAlertsPage] = useState(1);
+  const [messagesPage, setMessagesPage] = useState(1);
+  const [alertsPagination, setAlertsPagination] = useState(null);
+  const [messagesPagination, setMessagesPagination] = useState(null);
   const [counts, setCounts] = useState({
     alerts: 0,
     clients: 0,
@@ -40,56 +45,61 @@ const Notifications = () => {
 
   const totalUnread = counts.alerts + counts.clients + counts.org_admin + counts.driver + counts.deletions;
 
-  const fetchSystemAlerts = useCallback(async () => {
+  const fetchSystemAlerts = useCallback(async (page = alertsPage, signal) => {
     try {
-      const res = await axios.get(`${API_URL}/notifications`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const res = await api.get(`/notifications?page=${page}&limit=10`, { signal });
       setSystemAlerts(res.data.data || []);
+      setAlertsPagination(res.data.pagination || null);
       return res.data.unreadCount || 0;
     } catch (err) {
+      if (isAbortError(err)) return 0;
       console.error("Failed to fetch system alerts", err);
       return 0;
     }
-  }, [token]);
+  }, [alertsPage]);
 
   const markAlertRead = async (id) => {
+    const previousAlerts = systemAlerts;
+    const wasUnread = previousAlerts.some(a => a._id === id && !a.isRead);
+    setSystemAlerts(prev => prev.map(a =>
+      a._id === id ? { ...a, isRead: true } : a
+    ));
+    if (wasUnread) setCounts(prev => ({ ...prev, alerts: Math.max(0, prev.alerts - 1) }));
     try {
-      await axios.put(`${API_URL}/notifications/${id}/read`, {}, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setSystemAlerts(prev => prev.map(a =>
-        a._id === id ? { ...a, isRead: true } : a
-      ));
-      setCounts(prev => ({ ...prev, alerts: Math.max(0, prev.alerts - 1) }));
+      await api.put(`/notifications/${id}/read`, {});
     } catch (err) {
+      setSystemAlerts(previousAlerts);
+      if (wasUnread) setCounts(prev => ({ ...prev, alerts: prev.alerts + 1 }));
       console.error("Failed to mark alert as read", err);
     }
   };
 
   const markAllAlertsRead = async () => {
+    const previousAlerts = systemAlerts;
+    const previousAlertCount = counts.alerts;
+    setSystemAlerts(prev => prev.map(a => ({ ...a, isRead: true })));
+    setCounts(prev => ({ ...prev, alerts: 0 }));
     try {
-      await axios.put(`${API_URL}/notifications/read-all`, {}, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setSystemAlerts(prev => prev.map(a => ({ ...a, isRead: true })));
-      setCounts(prev => ({ ...prev, alerts: 0 }));
+      await api.put('/notifications/read-all', {});
     } catch (err) {
+      setSystemAlerts(previousAlerts);
+      setCounts(prev => ({ ...prev, alerts: previousAlertCount }));
       console.error("Failed to mark all alerts as read", err);
     }
   };
 
-  const fetchCounts = useCallback(async () => {
+  const fetchCounts = useCallback(async (signal) => {
     try {
       const [alertsCount, clientsRes, orgAdminRes, driverRes, deletionsRes] = await Promise.all([
-        fetchSystemAlerts(),
-        axios.get(`${API_URL}/contact/unread-count`, { headers: { Authorization: `Bearer ${token}` } }),
-        axios.get(`${API_URL}/internal-messages/org_admin/unread-count`, { headers: { Authorization: `Bearer ${token}` } }),
-        axios.get(`${API_URL}/internal-messages/driver/unread-count`, { headers: { Authorization: `Bearer ${token}` } }),
-        axios.get(user?.role === "super_admin"
-          ? `${API_URL}/super-admin/deletion-requests/pending-count`
-          : `${API_URL}/org-admin/deletion-requests/pending-count`,
-          { headers: { Authorization: `Bearer ${token}` } }
+        fetchSystemAlerts(undefined, signal),
+        api.get('/contact/unread-count', { signal }),
+        api.get('/internal-messages/org_admin/unread-count', { signal }),
+        api.get('/internal-messages/driver/unread-count', { signal }),
+        api.get(
+          user?.role === "super_admin"
+            ? '/super-admin/deletion-requests/pending-count'
+            : '/org-admin/deletion-requests/pending-count',
+          { signal }
         ),
       ]);
       setCounts({
@@ -100,34 +110,35 @@ const Notifications = () => {
         deletions: deletionsRes.data.count || 0
       });
     } catch (err) {
+      if (isAbortError(err)) return;
       console.error("Failed to fetch notification counts", err);
     }
-  }, [token, user, fetchSystemAlerts]);
+  }, [user?.role, fetchSystemAlerts]);
 
-  const fetchMessages = async (type) => {
+  const fetchMessages = useCallback(async (type, page = messagesPage, signal) => {
     setLoading(true);
     setError(null);
     try {
       let endpoint = "";
       if (type === "clients") {
-        endpoint = `${API_URL}/contact/messages`;
+        endpoint = `/contact/messages?page=${page}&limit=10`;
       } else if (type === "org_admin" || type === "driver") {
-        endpoint = `${API_URL}/internal-messages/${type}`;
+        endpoint = `/internal-messages/${type}?page=${page}&limit=10`;
       } else {
         setLoading(false);
         return;
       }
 
-      const response = await axios.get(endpoint, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const response = await api.get(endpoint, { signal });
       setMessages(response.data.data || []);
+      setMessagesPagination(response.data.pagination || null);
     } catch (err) {
+      if (isAbortError(err)) return;
       setError(err.response?.data?.message || "Failed to load messages");
     } finally {
-      setLoading(false);
+      if (!signal?.aborted) setLoading(false);
     }
-  };
+  }, [messagesPage]);
 
   // Socket listeners for real-time updates
   useEffect(() => {
@@ -143,7 +154,7 @@ const Notifications = () => {
     const onContactMessage = () => {
       setCounts(prev => ({ ...prev, clients: prev.clients + 1 }));
       if (activeTab === "clients") {
-        fetchMessages("clients");
+        fetchMessages("clients", messagesPage);
       }
     };
 
@@ -164,7 +175,7 @@ const Notifications = () => {
     const onInternalMessage = (message) => {
       if (message?.type === "org_admin" || message?.type === "driver") {
         setCounts(prev => ({ ...prev, [message.type]: prev[message.type] + 1 }));
-        if (activeTab === message.type) fetchMessages(message.type);
+        if (activeTab === message.type) fetchMessages(message.type, messagesPage);
       } else {
         fetchCounts();
       }
@@ -203,35 +214,49 @@ const Notifications = () => {
       socket.off("deletion-request:new", onDeletionRequest);
       socket.off("deletion-request:counts", onDeletionCounts);
     };
-  }, [activeTab, fetchCounts]);
+  }, [activeTab, fetchCounts, fetchMessages, messagesPage]);
 
   useEffect(() => {
-    fetchCounts();
-    if (activeTab !== "deletions" && activeTab !== "alerts") {
-      fetchMessages(activeTab);
+    const controller = new AbortController();
+    fetchCounts(controller.signal);
+    if (activeTab === "alerts") {
+      fetchSystemAlerts(alertsPage, controller.signal);
+    } else if (activeTab !== "deletions") {
+      fetchMessages(activeTab, messagesPage, controller.signal);
     }
-  }, [activeTab, token]);
+    return () => controller.abort();
+  }, [activeTab, fetchCounts, fetchMessages, fetchSystemAlerts, alertsPage, messagesPage]);
+
+  useEffect(() => {
+    setAlertsPage(1);
+    setMessagesPage(1);
+  }, [activeTab]);
 
   const markAsRead = async (id, type) => {
+    const previousMessages = messages;
+    const wasUnread = previousMessages.some(msg => msg._id === id && msg.status === "unread");
+    setMessages(prev => prev.map(msg => msg._id === id ? { ...msg, status: "read" } : msg));
+    if (wasUnread) setCounts(prev => ({ ...prev, [type]: Math.max(0, prev[type] - 1) }));
     try {
       const endpoint = type === "clients"
-        ? `${API_URL}/contact/${id}/read`
-        : `${API_URL}/internal-messages/${id}/read`;
+        ? `/contact/${id}/read`
+        : `/internal-messages/${id}/read`;
 
-      await axios.put(endpoint, {}, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-
-      setMessages(prev => prev.map(msg => msg._id === id ? { ...msg, status: "read" } : msg));
-      setCounts(prev => ({ ...prev, [type]: Math.max(0, prev[type] - 1) }));
+      await api.put(endpoint, {});
     } catch (err) {
+      setMessages(previousMessages);
+      if (wasUnread) setCounts(prev => ({ ...prev, [type]: prev[type] + 1 }));
       console.error("Failed to mark message as read", err);
     }
   };
 
-  const filteredAlerts = filterSeverity === "all"
-    ? systemAlerts
-    : systemAlerts.filter(a => a.severity === filterSeverity);
+  const filteredAlerts = useMemo(
+    () =>
+      filterSeverity === "all"
+        ? systemAlerts
+        : systemAlerts.filter((a) => a.severity === filterSeverity),
+    [filterSeverity, systemAlerts]
+  );
 
   const tabs = [
     { id: "alerts", label: "System Alerts", icon: <AlertTriangle className="w-4 h-4" /> },
@@ -347,11 +372,7 @@ const Notifications = () => {
             </div>
 
             {filteredAlerts.length === 0 ? (
-              <div className="p-12 bg-white rounded-2xl border border-primary/10 text-center">
-                <CheckCircle className="w-12 h-12 text-green-400 mx-auto mb-3" />
-                <p className="font-semibold text-primary/60">No alerts</p>
-                <p className="text-sm text-primary/40 mt-1">Everything is running smoothly</p>
-              </div>
+              <AdminEmptyState icon={CheckCircle} title="No alerts" message="Everything is running smoothly." />
             ) : (
               <div className="space-y-3">
                 {filteredAlerts.map(alert => {
@@ -423,6 +444,11 @@ const Notifications = () => {
                     </div>
                   );
                 })}
+                <PaginationControls
+                  pagination={alertsPagination}
+                  onPageChange={setAlertsPage}
+                  itemLabel="alerts"
+                />
               </div>
             )}
           </div>
@@ -433,29 +459,22 @@ const Notifications = () => {
         ) : (
           <div className="space-y-3">
             {loading ? (
-              <div className="flex items-center justify-center h-48 bg-white/50 rounded-2xl border border-primary/10">
-                <div className="w-8 h-8 border-4 border-primary/20 border-t-primary rounded-full animate-spin" />
-              </div>
+              <ListSkeleton rows={5} />
             ) : error ? (
-              <div className="p-6 bg-red-50 rounded-2xl border border-red-200 text-red-600 text-center font-medium">
-                {error}
-              </div>
+              <AdminErrorState message={error} onRetry={() => fetchMessages(activeTab, messagesPage)} />
             ) : messages.length === 0 ? (
-              <div className="p-12 bg-white rounded-2xl border border-primary/10 text-center">
-                <Bell className="w-12 h-12 text-primary/20 mx-auto mb-3" />
-                <p className="font-semibold text-primary/60">No messages</p>
-                <p className="text-sm text-primary/40 mt-1">No messages found for this category</p>
-              </div>
+              <AdminEmptyState icon={Bell} title="No messages" message="No messages found for this category." />
             ) : (
-              messages.map(msg => (
-                <div
-                  key={msg._id}
-                  className={`bg-white rounded-xl border overflow-hidden transition-all ${
-                    msg.status === "unread"
-                      ? "border-l-4 border-l-primary border-primary/15 shadow-sm"
-                      : "border-gray-200 opacity-70"
-                  }`}
-                >
+              <>
+                {messages.map(msg => (
+                  <div
+                    key={msg._id}
+                    className={`bg-white rounded-xl border overflow-hidden transition-all ${
+                      msg.status === "unread"
+                        ? "border-l-4 border-l-primary border-primary/15 shadow-sm"
+                        : "border-gray-200 opacity-70"
+                    }`}
+                  >
                   <div className="p-4 sm:p-5">
                     <div className="flex items-start gap-3">
                       {/* Unread indicator */}
@@ -507,8 +526,14 @@ const Notifications = () => {
                       </div>
                     </div>
                   </div>
-                </div>
-              ))
+                  </div>
+                ))}
+                <PaginationControls
+                  pagination={messagesPagination}
+                  onPageChange={setMessagesPage}
+                  itemLabel="messages"
+                />
+              </>
             )}
           </div>
         )}

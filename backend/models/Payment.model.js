@@ -4,8 +4,8 @@ import mongoose from "mongoose";
  * Payment — immutable transaction record for a PickupRequest.
  *
  * Security notes:
- *  - `amount` is ALWAYS taken from the server-side PickupRequest.estimatedPrice,
- *    never from the client. Never trust the client to set the amount.
+ *  - `amount` is always a trusted server-side pickup price, recomputed before
+ *    charging. Never trust the client to set the amount.
  *  - `transactionUuid` is unique per attempt and used as the idempotency key
  *    when verifying with the eSewa status API.
  *  - We never store eSewa secret keys, card data, or PII beyond the eSewa
@@ -78,6 +78,9 @@ const paymentSchema = new mongoose.Schema(
 
 paymentSchema.index({ pickupId: 1, status: 1 });
 paymentSchema.index({ customerId: 1, createdAt: -1 });
+paymentSchema.index({ status: 1, createdAt: -1 });
+paymentSchema.index({ method: 1, status: 1, createdAt: -1 });
+paymentSchema.index({ driverId: 1, status: 1, createdAt: -1 });
 paymentSchema.index(
   { transactionUuid: 1 },
   {

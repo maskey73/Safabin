@@ -1,19 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
-import {
-  Chart as ChartJS,
-  CategoryScale,
-  LinearScale,
-  PointElement,
-  ArcElement,
-  Title,
-  Tooltip,
-  Legend,
-} from 'chart.js';
-import { Bubble } from 'react-chartjs-2';
 import useZoneStore from '../stores/useZoneStore';
 import useAuthStore from '../stores/useAuthStore';
-
-ChartJS.register(CategoryScale, LinearScale, PointElement, ArcElement, Title, Tooltip, Legend);
+import LazyChart from '../components/charts/LazyChart';
 
 const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 
@@ -43,31 +31,25 @@ const DAY_COLORS = {
 };
 
 const ORG_PALETTE = ['#3b82f6', '#a855f7', '#22c55e', '#f59e0b', '#ef4444', '#14b8a6', '#f97316', '#ec4899'];
+const EMPTY_ZONE_FORM = { city: '', area: '', truckId: '', day: '', time: '', truckType: '', orgId: '' };
+
+function zoneFormFromEdit(editZone) {
+  if (!editZone) return EMPTY_ZONE_FORM;
+  return {
+    city: editZone.city || '',
+    area: editZone.area || '',
+    truckId: editZone.truckObjectId ? String(editZone.truckObjectId) : '',
+    day: editZone.day || '',
+    time: editZone.time || '',
+    truckType: editZone.truckType || '',
+    orgId: editZone.orgId ? String(editZone.orgId) : '',
+  };
+}
 
 // ─── Add/Edit Zone Modal ───────────────────────────────────────────────────────
 function ZoneModal({ isOpen, onClose, onSubmit, trucks, organizations, isSuperAdmin, isSubmitting, editZone }) {
-  const emptyForm = { city: '', area: '', truckId: '', day: '', time: '', truckType: '', orgId: '' };
-  const [form, setForm] = useState(emptyForm);
+  const [form, setForm] = useState(() => zoneFormFromEdit(editZone));
   const [error, setError] = useState('');
-
-  useEffect(() => {
-    if (isOpen) {
-      if (editZone) {
-        setForm({
-          city: editZone.city || '',
-          area: editZone.area || '',
-          truckId: editZone.truckObjectId ? String(editZone.truckObjectId) : '',
-          day: editZone.day || '',
-          time: editZone.time || '',
-          truckType: editZone.truckType || '',
-          orgId: editZone.orgId ? String(editZone.orgId) : '',
-        });
-      } else {
-        setForm(emptyForm);
-      }
-      setError('');
-    }
-  }, [isOpen, editZone]);
 
   // Trucks filtered by selected duty type — uses dutyType field (not truckType which is BIO/NON_BIO)
   const filteredTrucks = useMemo(() => {
@@ -450,7 +432,7 @@ function ZonesBubbleChart({ zones, organizations, isSuperAdmin }) {
       </div>
     );
   }
-  return <Bubble data={chartData} options={options} />;
+  return <LazyChart type="bubble" data={chartData} options={options} />;
 }
 
 // ─── Main Zones Page ───────────────────────────────────────────────────────────
@@ -608,16 +590,19 @@ const Zones = () => {
         )}
       </div>
 
-      <ZoneModal
-        isOpen={modalOpen}
-        onClose={handleCloseModal}
-        onSubmit={handleSubmit}
-        trucks={trucks}
-        organizations={organizations}
-        isSuperAdmin={isSuperAdmin}
-        isSubmitting={isSubmitting}
-        editZone={editZone}
-      />
+      {modalOpen && (
+        <ZoneModal
+          key={editZone?.id || "new-zone"}
+          isOpen={modalOpen}
+          onClose={handleCloseModal}
+          onSubmit={handleSubmit}
+          trucks={trucks}
+          organizations={organizations}
+          isSuperAdmin={isSuperAdmin}
+          isSubmitting={isSubmitting}
+          editZone={editZone}
+        />
+      )}
     </div>
   );
 };

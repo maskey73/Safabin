@@ -1,12 +1,15 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import useDriverStore from "../stores/useDriverStore";
 import useAuthStore from "../stores/useAuthStore";
 import { Users, UserCheck, UserX, Truck } from "lucide-react";
 import StatsCard from "../components/dashboard/StatsCard";
+import PaginationControls from "../components/shared/PaginationControls";
+import { AdminEmptyState, AdminErrorState, TableSkeleton } from "../components/shared/AdminListStates";
+import api from "../utils/api";
 
 const Drivers = () => {
-  const { drivers, isLoading, error, fetchDrivers, addDriver, updateDriver, deleteDriver, requestDeletion } = useDriverStore();
+  const { drivers, pagination, isLoading, error, fetchDrivers, addDriver, updateDriver, deleteDriver, requestDeletion } = useDriverStore();
   const navigate = useNavigate();
   const user = useAuthStore((s) => s.user);
   const isSuperAdmin = user?.role === "super_admin";
@@ -21,14 +24,18 @@ const Drivers = () => {
   const [formError, setFormError] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
-  useEffect(() => { fetchDrivers(); }, [fetchDrivers]);
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchDrivers({ page: 1, limit: 10, signal: controller.signal });
+    return () => controller.abort();
+  }, [fetchDrivers]);
 
   useEffect(() => {
     if (isSuperAdmin) {
-      const token = useAuthStore.getState().token;
-      const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5001/api";
-      fetch(`${API_URL}/super-admin/organizations`, { headers: { Authorization: `Bearer ${token}` } })
-        .then(r => r.json()).then(data => setOrgs(data.organizations || [])).catch(() => {});
+      const controller = new AbortController();
+      api.get("/super-admin/organizations", { signal: controller.signal })
+        .then(({ data }) => setOrgs(data.organizations || [])).catch(() => {});
+      return () => controller.abort();
     }
   }, [isSuperAdmin]);
 
@@ -67,9 +74,15 @@ const Drivers = () => {
 
   const openEdit = (d) => { setEditDriver(d); setEditForm({ name: d.name, email: d.email, phone: d.phone, orgId: d.orgId || "" }); setFormError(""); };
 
-  const unassignedCount = drivers.filter(d => d.truck === "No Truck").length;
-  const availableCount = drivers.filter(d => d.status === "Available").length;
-  const busyCount = drivers.filter(d => d.status === "Busy").length;
+  const totalCount = pagination?.total ?? drivers.length;
+  const driverStats = useMemo(
+    () => ({
+      unassigned: drivers.filter((d) => d.truck === "No Truck").length,
+      available: drivers.filter((d) => d.status === "Available").length,
+      busy: drivers.filter((d) => d.status === "Busy").length,
+    }),
+    [drivers]
+  );
 
   return (
     <div className="space-y-6">
@@ -86,19 +99,17 @@ const Drivers = () => {
 
       {/* Stats */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-        <StatsCard title="Total Drivers" value={drivers.length} label="All drivers" icon={<Users className="w-5 h-5 text-primary" />} iconBg="bg-primary/8" />
-        <StatsCard title="Available" value={availableCount} label="Ready for tasks" icon={<UserCheck className="w-5 h-5 text-emerald-600" />} iconBg="bg-emerald-100" valueColor="text-emerald-600" />
-        <StatsCard title="On Task" value={busyCount} label="Currently busy" icon={<UserX className="w-5 h-5 text-amber-600" />} iconBg="bg-amber-100" valueColor="text-amber-600" />
-        <StatsCard title="No Truck" value={unassignedCount} label="Unassigned" icon={<Truck className="w-5 h-5 text-red-500" />} iconBg="bg-red-100" valueColor="text-red-500" />
+        <StatsCard title="Total Drivers" value={totalCount} label="All drivers" icon={<Users className="w-5 h-5 text-primary" />} iconBg="bg-primary/8" />
+        <StatsCard title="Available" value={driverStats.available} label="Ready for tasks" icon={<UserCheck className="w-5 h-5 text-emerald-600" />} iconBg="bg-emerald-100" valueColor="text-emerald-600" />
+        <StatsCard title="On Task" value={driverStats.busy} label="Currently busy" icon={<UserX className="w-5 h-5 text-amber-600" />} iconBg="bg-amber-100" valueColor="text-amber-600" />
+        <StatsCard title="No Truck" value={driverStats.unassigned} label="Unassigned" icon={<Truck className="w-5 h-5 text-red-500" />} iconBg="bg-red-100" valueColor="text-red-500" />
       </div>
 
       {/* Table */}
       {isLoading ? (
-        <div className="flex items-center justify-center h-48 bg-white rounded-2xl border border-primary/10">
-          <div className="w-6 h-6 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
-        </div>
+        <TableSkeleton columns={isSuperAdmin ? 7 : 6} rows={7} />
       ) : error ? (
-        <div className="p-6 bg-white rounded-2xl border border-red-200 text-red-600 text-center text-sm">{error}</div>
+        <AdminErrorState message={error} onRetry={() => fetchDrivers({ page: pagination?.page || 1, limit: 10 })} />
       ) : (
         <div className="bg-white rounded-2xl border border-primary/10 overflow-hidden shadow-sm">
           <div className="overflow-x-auto">
@@ -116,7 +127,11 @@ const Drivers = () => {
               </thead>
               <tbody>
                 {drivers.length === 0 ? (
-                  <tr><td colSpan={isSuperAdmin ? 7 : 6} className="px-6 py-12 text-center text-primary/30 text-sm">No drivers found.</td></tr>
+                  <tr>
+                    <td colSpan={isSuperAdmin ? 7 : 6} className="p-0">
+                      <AdminEmptyState icon={Users} title="No drivers found" message="Driver accounts will appear here once they are added." />
+                    </td>
+                  </tr>
                 ) : drivers.map(d => (
                   <tr key={d.id} className="border-b border-primary/5 hover:bg-primary/2 transition-colors">
                     <td className="px-5 py-3.5">
@@ -153,6 +168,11 @@ const Drivers = () => {
               </tbody>
             </table>
           </div>
+          <PaginationControls
+            pagination={pagination}
+            onPageChange={(nextPage) => fetchDrivers({ page: nextPage, limit: 10 })}
+            itemLabel="drivers"
+          />
         </div>
       )}
 

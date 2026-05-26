@@ -1,46 +1,61 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import useAuthStore from "../stores/useAuthStore";
-import axios from "axios";
-
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5001/api";
+import api from "../utils/api";
+import PaginationControls from "../components/shared/PaginationControls";
+import { AdminEmptyState, AdminErrorState, ListSkeleton } from "../components/shared/AdminListStates";
+import { ClipboardList } from "lucide-react";
 
 const DeletionRequests = ({ onUpdate }) => {
   const user = useAuthStore((s) => s.user);
-  const token = useAuthStore((s) => s.token);
   const isSuperAdmin = user?.role === "super_admin";
 
   const [requests, setRequests] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
   const [filter, setFilter] = useState("pending");
+  const [page, setPage] = useState(1);
+  const [pagination, setPagination] = useState(null);
   const [reviewTarget, setReviewTarget] = useState(null);
   const [reviewNote, setReviewNote] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
-  const fetchRequests = async () => {
+  const fetchRequests = useCallback(async () => {
     setIsLoading(true); setError(null);
     try {
       const url = isSuperAdmin
-        ? `${API_URL}/super-admin/deletion-requests${filter ? `?status=${filter}` : ""}`
-        : `${API_URL}/org-admin/deletion-requests`;
-      const res = await axios.get(url, { headers: { Authorization: `Bearer ${token}` } });
+        ? `/super-admin/deletion-requests?page=${page}&limit=10${filter ? `&status=${filter}` : ""}`
+        : `/org-admin/deletion-requests?page=${page}&limit=10`;
+      const res = await api.get(url);
       setRequests(res.data.data || []);
+      setPagination(res.data.pagination || null);
     } catch (err) {
       setError(err.response?.data?.message || "Failed to fetch requests");
     }
     setIsLoading(false);
+  }, [filter, isSuperAdmin, page]);
+
+  useEffect(() => {
+    const timer = setTimeout(fetchRequests, 0);
+    return () => clearTimeout(timer);
+  }, [fetchRequests]);
+
+  const handleFilterChange = (nextFilter) => {
+    setFilter(nextFilter);
+    setPage(1);
   };
 
-  useEffect(() => { fetchRequests(); }, [filter]);
-
   const handleReview = async (action) => {
+    const previousRequests = requests;
+    const nextStatus = action === "approved" ? "approved" : "rejected";
     setSubmitting(true);
+    setRequests(prev => prev.map(r => r._id === reviewTarget._id ? { ...r, status: nextStatus, reviewNote } : r));
     try {
-      await axios.put(`${API_URL}/super-admin/deletion-requests/${reviewTarget._id}`, { action, reviewNote }, { headers: { Authorization: `Bearer ${token}` } });
+      await api.put(`/super-admin/deletion-requests/${reviewTarget._id}`, { action, reviewNote });
       setReviewTarget(null); setReviewNote("");
       fetchRequests();
       if (onUpdate) onUpdate();
     } catch (err) {
+      setRequests(previousRequests);
       alert(err.response?.data?.message || "Failed to review request");
     }
     setSubmitting(false);
@@ -51,8 +66,6 @@ const DeletionRequests = ({ onUpdate }) => {
     approved: "bg-green-100 text-green-700",
     rejected: "bg-red-100 text-red-700"
   };
-
-  const pendingCount = requests.filter(r => r.status === "pending").length;
 
   return (
     <div className="space-y-6">
@@ -65,7 +78,7 @@ const DeletionRequests = ({ onUpdate }) => {
         {isSuperAdmin && (
           <div className="flex items-center gap-1 bg-primary/5 rounded-xl p-1">
             {["pending", "approved", "rejected", ""].map(f => (
-              <button key={f} onClick={() => setFilter(f)} className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition ${filter === f ? "bg-white text-primary shadow-sm" : "text-primary/50 hover:text-primary"}`}>
+              <button key={f} onClick={() => handleFilterChange(f)} className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition ${filter === f ? "bg-white text-primary shadow-sm" : "text-primary/50 hover:text-primary"}`}>
                 {f || "All"}
               </button>
             ))}
@@ -93,11 +106,11 @@ const DeletionRequests = ({ onUpdate }) => {
 
       {/* Request Cards */}
       {isLoading ? (
-        <div className="flex items-center justify-center h-48 bg-white/50 rounded-2xl border border-primary/10"><div className="w-8 h-8 border-4 border-primary/20 border-t-accent rounded-full animate-spin" /></div>
+        <ListSkeleton rows={5} />
       ) : error ? (
-        <div className="p-6 bg-red-50 rounded-2xl border border-red-200 text-red-600 text-center font-medium">{error}</div>
+        <AdminErrorState message={error} onRetry={fetchRequests} />
       ) : requests.length === 0 ? (
-        <div className="p-12 bg-white rounded-2xl border border-primary/10 text-center text-primary/40">No deletion requests found.</div>
+        <AdminEmptyState icon={ClipboardList} title="No deletion requests found" message={isSuperAdmin ? "Requests from organization admins will appear here." : "Submitted deletion requests will appear here."} />
       ) : (
         <div className="space-y-3">
           {requests.map(r => (
@@ -134,6 +147,11 @@ const DeletionRequests = ({ onUpdate }) => {
               </div>
             </div>
           ))}
+          <PaginationControls
+            pagination={pagination}
+            onPageChange={setPage}
+            itemLabel="requests"
+          />
         </div>
       )}
 

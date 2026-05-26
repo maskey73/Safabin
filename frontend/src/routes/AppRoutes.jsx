@@ -1,7 +1,6 @@
 import React, { Suspense, lazy } from "react";
 import { Routes, Route, Navigate, useLocation } from "react-router-dom";
 
-import DashboardLayout from "../components/layout/DashboardLayout";
 import { Footer } from "../components/Headers/Footer";
 import { Header } from "../components/Headers/Header";
 // OTP is now handled via modal inside Login/Signup pages
@@ -9,6 +8,7 @@ import ProtectedRoute from "../components/auth/ProtectedRoute";
 import useAuthStore from "../stores/useAuthStore";
 
 const Dashboard = lazy(() => import("../pages/Dashboard"));
+const DashboardLayout = lazy(() => import("../components/layout/DashboardLayout"));
 const HomePage = lazy(() => import("../pages/HomePage"));
 const CustomerLoginPage = lazy(() => import("../components/auth/CustomerLogin"));
 const CustomerSignUpPage = lazy(() => import("../components/auth/CustomerSignup"));
@@ -17,6 +17,7 @@ const AboutUs = lazy(() => import("../pages/AboutUs"));
 const OurTeam = lazy(() => import("../pages/OurTeam"));
 const ContactUs = lazy(() => import("../pages/ContactUs"));
 const Profile = lazy(() => import("../pages/Profile"));
+const DownloadApp = lazy(() => import("../pages/DownloadApp"));
 const CustomerDashboard = lazy(() => import("../components/users/CustomerDashboard"));
 const SchedulePage = lazy(() => import("../components/users/SchedulePage"));
 const UploadWastePage = lazy(() => import("../components/users/UploadWastePage"));
@@ -51,8 +52,10 @@ const DriverStatusToast = lazy(() => import("../components/Driver/DriverStatusTo
 const DriverNavbar = lazy(() => import("../components/Driver/DriverNavbar"));
 const DriverNotifications = lazy(() => import("../components/Driver/DriverNotifications"));
 const ScheduleToast = lazy(() => import("../components/ml/ScheduleToast"));
-const DebugScheduleData = lazy(() => import("../components/debug/DebugScheduleData"));
 const HelpSupportPage = lazy(() => import("../pages/HelpandSupport"));
+const DebugScheduleData = import.meta.env.DEV
+  ? lazy(() => import("../components/debug/DebugScheduleData"))
+  : null;
 
 const RouteFallback = () => (
   <div className="flex min-h-[50vh] items-center justify-center px-4 text-sm text-primary">
@@ -163,6 +166,14 @@ const AppRoutes = () => {
         <Route
           path="/billing"
           element={<CustomerBillingRoute />}
+        />
+        <Route
+          path="/download-app"
+          element={
+            <ProtectedRoute allowedRoles={['customer_admin']}>
+              <DownloadApp />
+            </ProtectedRoute>
+          }
         />
         <Route
           path="/searching"
@@ -277,8 +288,12 @@ const AppRoutes = () => {
           } />
         </Route>
 
-        {/* Debug Route - for testing */}
-        <Route path="/debug-schedule" element={<DebugScheduleData />} />
+        {import.meta.env.DEV && (
+          <Route
+            path="/debug-schedule"
+            element={<DebugScheduleData />}
+          />
+        )}
 
         {/* Catch all */}
         <Route path="*" element={<Navigate to="/" replace />} />

@@ -1,9 +1,19 @@
-import React, { useEffect, useState } from "react";
+import React, { Suspense, lazy, useEffect, useState } from "react";
 import useAreaStore from "../stores/useAreaStore";
 import useAuthStore from "../stores/useAuthStore";
 import { MapPin, CheckCircle, PauseCircle, Store } from "lucide-react";
 import StatsCard from "../components/dashboard/StatsCard";
-import LocationPickerMap from "../components/shared/LocationPickerMap";
+import PaginationControls from "../components/shared/PaginationControls";
+import { AdminEmptyState, AdminErrorState, TableSkeleton } from "../components/shared/AdminListStates";
+import api from "../utils/api";
+
+const LocationPickerMap = lazy(() => import("../components/shared/LocationPickerMap"));
+
+const MapFallback = () => (
+  <div className="flex h-72 items-center justify-center rounded-2xl border border-primary/15 bg-primary/5 text-sm font-medium text-primary/60">
+    Loading map...
+  </div>
+);
 
 const TYPE_BADGES = {
   commercial: { cls: "bg-blue-100 text-blue-700", icon: "C" },
@@ -14,7 +24,7 @@ const TYPE_BADGES = {
 
 
 const Areas = () => {
-  const { areas, loading, error, fetchAreas, createArea, updateArea, deleteArea } = useAreaStore();
+  const { areas, pagination, loading, error, fetchAreas, createArea, updateArea, deleteArea } = useAreaStore();
   const user = useAuthStore((s) => s.user);
   const isSuperAdmin = user?.role === "super_admin";
 
@@ -27,14 +37,12 @@ const Areas = () => {
   const [formError, setFormError] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
-  useEffect(() => { fetchAreas(); }, [fetchAreas]);
+  useEffect(() => { fetchAreas({ page: 1, limit: 10 }); }, [fetchAreas]);
 
   useEffect(() => {
     if (isSuperAdmin) {
-      const token = useAuthStore.getState().token;
-      const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5001/api";
-      fetch(`${API_URL}/super-admin/organizations`, { headers: { Authorization: `Bearer ${token}` } })
-        .then(r => r.json()).then(data => setOrgs(data.organizations || [])).catch(() => {});
+      api.get("/super-admin/organizations")
+        .then(({ data }) => setOrgs(data.organizations || [])).catch(() => {});
     }
   }, [isSuperAdmin]);
 
@@ -65,7 +73,7 @@ const Areas = () => {
       ...(editForm.latitude && editForm.longitude ? { coordinates: { latitude: Number(editForm.latitude), longitude: Number(editForm.longitude) }, address: editForm.address } : {}),
       ...(isSuperAdmin && editForm.orgId ? { orgId: editForm.orgId } : {}),
     };
-    const result = await updateArea(editArea._id, payload);
+    const result = await updateArea(editArea._id, payload, { optimistic: true });
     setSubmitting(false);
     if (result.success) setEditArea(null); else setFormError(result.error);
   };
@@ -92,6 +100,7 @@ const Areas = () => {
     setFormError("");
   };
 
+  const totalCount = pagination?.total ?? areas.length;
   const activeCount = areas.filter(d => d.isActive !== false).length;
   const inactiveCount = areas.filter(d => d.isActive === false).length;
   const typeCount = (type) => areas.filter(d => d.type === type).length;
@@ -113,7 +122,7 @@ const Areas = () => {
 
       {/* Stats */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-        <StatsCard title="Total Areas" value={areas.length} label="All collection areas" icon={<MapPin className="w-5 h-5 text-primary" />} iconBg="bg-primary/8" />
+        <StatsCard title="Total Areas" value={totalCount} label="All collection areas" icon={<MapPin className="w-5 h-5 text-primary" />} iconBg="bg-primary/8" />
         <StatsCard title="Active" value={activeCount} label="Currently served" icon={<CheckCircle className="w-5 h-5 text-emerald-600" />} iconBg="bg-emerald-100" valueColor="text-emerald-600" />
         <StatsCard title="Inactive" value={inactiveCount} label="Paused areas" icon={<PauseCircle className="w-5 h-5 text-amber-600" />} iconBg="bg-amber-100" valueColor="text-amber-600" />
         <StatsCard title="Commercial" value={typeCount("commercial")} label="Business areas" icon={<Store className="w-5 h-5 text-blue-600" />} iconBg="bg-blue-100" valueColor="text-blue-600" />
@@ -121,11 +130,9 @@ const Areas = () => {
 
       {/* Table */}
       {loading ? (
-        <div className="flex items-center justify-center h-48 bg-white rounded-2xl border border-primary/10">
-          <div className="w-6 h-6 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
-        </div>
+        <TableSkeleton columns={isSuperAdmin ? 6 : 5} rows={7} />
       ) : error ? (
-        <div className="p-6 bg-white rounded-2xl border border-red-200 text-red-600 text-center text-sm">{error}</div>
+        <AdminErrorState message={error} onRetry={() => fetchAreas({ page: pagination?.page || 1, limit: 10 })} />
       ) : (
         <div className="bg-white rounded-2xl border border-primary/10 overflow-hidden shadow-sm">
           <div className="overflow-x-auto">
@@ -142,7 +149,11 @@ const Areas = () => {
               </thead>
               <tbody>
                 {areas.length === 0 ? (
-                  <tr><td colSpan={isSuperAdmin ? 7 : 5} className="px-6 py-12 text-center text-primary/30 text-sm">No collection areas found.</td></tr>
+                  <tr>
+                    <td colSpan={isSuperAdmin ? 6 : 5} className="p-0">
+                      <AdminEmptyState icon={MapPin} title="No collection areas found" message="Collection areas will appear here once they are added." />
+                    </td>
+                  </tr>
                 ) : areas.map(d => {
                   const badge = TYPE_BADGES[d.type] || { cls: "bg-gray-100 text-gray-700", icon: "?" };
                   const hasCoords = d.coordinates?.latitude && d.coordinates?.longitude;
@@ -192,6 +203,11 @@ const Areas = () => {
               </tbody>
             </table>
           </div>
+          <PaginationControls
+            pagination={pagination}
+            onPageChange={(nextPage) => fetchAreas({ page: nextPage, limit: 10 })}
+            itemLabel="areas"
+          />
         </div>
       )}
 
@@ -224,13 +240,15 @@ const Areas = () => {
                   <p className="text-[11px] text-primary/40 mt-1">ML size multiplier (1.0 = avg)</p>
                 </div>
               </div>
-              <LocationPickerMap
-                label="Area Center Location"
-                placeholder="Search area location..."
-                height="220px"
-                value={{ latitude: form.latitude, longitude: form.longitude, address: form.address }}
-                onChange={({ latitude, longitude, address }) => setForm({ ...form, latitude, longitude, address })}
-              />
+              <Suspense fallback={<MapFallback />}>
+                <LocationPickerMap
+                  label="Area Center Location"
+                  placeholder="Search area location..."
+                  height="220px"
+                  value={{ latitude: form.latitude, longitude: form.longitude, address: form.address }}
+                  onChange={({ latitude, longitude, address }) => setForm({ ...form, latitude, longitude, address })}
+                />
+              </Suspense>
               {isSuperAdmin && (
                 <div>
                   <label className="block text-sm font-medium text-primary/60 mb-1">Organization *</label>
@@ -276,13 +294,15 @@ const Areas = () => {
                   <p className="text-[11px] text-primary/40 mt-1">ML size multiplier (1.0 = avg)</p>
                 </div>
               </div>
-              <LocationPickerMap
-                label="Area Center Location"
-                placeholder="Search area location..."
-                height="220px"
-                value={{ latitude: editForm.latitude, longitude: editForm.longitude, address: editForm.address }}
-                onChange={({ latitude, longitude, address }) => setEditForm({ ...editForm, latitude, longitude, address })}
-              />
+              <Suspense fallback={<MapFallback />}>
+                <LocationPickerMap
+                  label="Area Center Location"
+                  placeholder="Search area location..."
+                  height="220px"
+                  value={{ latitude: editForm.latitude, longitude: editForm.longitude, address: editForm.address }}
+                  onChange={({ latitude, longitude, address }) => setEditForm({ ...editForm, latitude, longitude, address })}
+                />
+              </Suspense>
               {isSuperAdmin && (
                 <div>
                   <label className="block text-sm font-medium text-primary/60 mb-1">Organization</label>

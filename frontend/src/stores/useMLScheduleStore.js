@@ -1,8 +1,10 @@
 import { create } from "zustand";
 import api from "../utils/api";
+import { isAbortError } from "../utils/requests";
 
 const useMLScheduleStore = create((set, get) => ({
     schedules: [],
+    schedulePagination: null,
     currentSchedule: null,
     prediction: null,
     publicSchedule: null,
@@ -58,20 +60,22 @@ const useMLScheduleStore = create((set, get) => ({
     },
 
     // Fetch all ML schedules (history)
-    fetchSchedules: async (filters = {}) => {
+    fetchSchedules: async (filters = {}, config = {}) => {
         set({ loading: true, error: null });
         try {
             const params = new URLSearchParams();
             if (filters.status) params.append("status", filters.status);
             if (filters.page) params.append("page", filters.page);
-            if (filters.limit) params.append("limit", filters.limit);
+            params.append("limit", filters.limit || 10);
 
-            const response = await api.get(`/ml-schedule?${params.toString()}`);
+            const response = await api.get(`/ml-schedule?${params.toString()}`, config);
             set({
                 schedules: response.data.data || [],
+                schedulePagination: response.data.pagination || null,
                 loading: false,
             });
         } catch (error) {
+            if (isAbortError(error)) return;
             console.error("Failed to fetch ML schedules:", error);
             set({
                 error: error.response?.data?.message || "Failed to fetch schedules",
@@ -146,7 +150,7 @@ const useMLScheduleStore = create((set, get) => ({
             const response = await api.get("/ml-schedule/health");
             set({ mlHealth: response.data.data });
             return response.data.data;
-        } catch (error) {
+        } catch {
             set({ mlHealth: { status: "offline" } });
             return { status: "offline" };
         }
@@ -211,11 +215,12 @@ const useMLScheduleStore = create((set, get) => ({
     },
 
     // Driver marks an area assignment as completed
-    completeAssignment: async (scheduleId, areaName, note = "") => {
+    completeAssignment: async (scheduleId, areaName, actualWasteKg, note = "") => {
         set({ loading: true, error: null });
         try {
             const response = await api.post(`/ml-schedule/${scheduleId}/complete-area`, {
                 area: areaName,
+                actualWasteKg,
                 note,
             });
             // Refresh driver assignments after completion
@@ -237,7 +242,7 @@ const useMLScheduleStore = create((set, get) => ({
     fetchCompletions: async (page = 1) => {
         set({ loading: true, error: null });
         try {
-            const response = await api.get(`/ml-schedule/completions?page=${page}&limit=50`);
+            const response = await api.get(`/ml-schedule/completions?page=${page}&limit=10`);
             set({ completions: response.data.data || [], loading: false });
         } catch (error) {
             console.error("Failed to fetch completions:", error);

@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import api from "../utils/api";
+import { isAbortError } from "../utils/requests";
 
 const useBillingStore = create((set, get) => ({
   bills: [],
@@ -25,16 +26,17 @@ const useBillingStore = create((set, get) => ({
   configLoading: false,
 
   // ── Customer / Admin: fetch my bills ──
-  fetchMyBills: async () => {
+  fetchMyBills: async (config = {}) => {
     set({ loading: true, error: null });
     try {
-      const res = await api.get("/billing/my-bills");
+      const res = await api.get("/billing/my-bills?limit=10&page=1", config);
       set({
         bills: res.data.bills,
         summary: res.data.summary,
         loading: false,
       });
     } catch (err) {
+      if (isAbortError(err)) return;
       set({
         loading: false,
         error: err.response?.data?.message || "Failed to fetch bills",
@@ -90,7 +92,7 @@ const useBillingStore = create((set, get) => ({
   // ── Customer / Admin: payment history ──
   fetchPaymentHistory: async () => {
     try {
-      const res = await api.get("/billing/history");
+      const res = await api.get("/billing/history?limit=10&page=1");
       set({ history: res.data.history });
     } catch (err) {
       console.error("Failed to fetch payment history:", err);
@@ -98,11 +100,11 @@ const useBillingStore = create((set, get) => ({
   },
 
   // ── Admin dashboard: billing overview (supports billedRole filter) ──
-  fetchBillingOverview: async (params = {}) => {
+  fetchBillingOverview: async (params = {}, config = {}) => {
     set({ adminLoading: true });
     try {
-      const query = new URLSearchParams(params).toString();
-      const res = await api.get(`/billing/admin/overview?${query}`);
+      const query = new URLSearchParams({ limit: 10, ...params }).toString();
+      const res = await api.get(`/billing/admin/overview?${query}`, config);
       set({
         adminBills: res.data.bills,
         billingAccounts: res.data.accounts || [],
@@ -112,6 +114,7 @@ const useBillingStore = create((set, get) => ({
         adminLoading: false,
       });
     } catch (err) {
+      if (isAbortError(err)) return;
       set({ adminLoading: false });
       console.error("Failed to fetch billing overview:", err);
     }
@@ -123,7 +126,7 @@ const useBillingStore = create((set, get) => ({
       accountDetailsLoading: { ...state.accountDetailsLoading, [customerId]: true },
     }));
     try {
-      const query = new URLSearchParams(params).toString();
+      const query = new URLSearchParams({ limit: 10, ...params }).toString();
       const res = await api.get(`/billing/admin/accounts/${customerId}?${query}`);
       set((state) => ({
         accountDetails: {
@@ -189,7 +192,7 @@ const useBillingStore = create((set, get) => ({
   fetchBillingConfig: async () => {
     set({ configLoading: true });
     try {
-      const res = await api.get("/billing/config");
+      const res = await api.get("/billing/config?limit=10&page=1");
       const defaultFees = { customerFee: 500, adminFee: 1000 };
       set({
         billingConfigs: res.data.configs || [],

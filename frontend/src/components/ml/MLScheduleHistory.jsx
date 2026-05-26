@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import useMLScheduleStore from "../../stores/useMLScheduleStore";
+import PaginationControls from "../shared/PaginationControls";
 
 const STATUS_BADGES = {
   draft: { bg: "bg-gray-100", text: "text-gray-700", label: "Draft" },
@@ -11,6 +12,7 @@ const STATUS_BADGES = {
 const MLScheduleHistory = () => {
   const {
     schedules,
+    schedulePagination,
     loading,
     error,
     fetchSchedules,
@@ -20,15 +22,21 @@ const MLScheduleHistory = () => {
   } = useMLScheduleStore();
 
   const [statusFilter, setStatusFilter] = useState("");
+  const [page, setPage] = useState(1);
   const [viewingId, setViewingId] = useState(null);
 
   useEffect(() => {
-    fetchSchedules({ status: statusFilter || undefined });
-  }, [statusFilter]);
+    fetchSchedules({ status: statusFilter || undefined, page, limit: 10 });
+  }, [fetchSchedules, statusFilter, page]);
 
   const handleView = async (id) => {
     setViewingId(id);
     await fetchScheduleById(id);
+  };
+
+  const handleStatusFilterChange = (nextStatus) => {
+    setStatusFilter(nextStatus);
+    setPage(1);
   };
 
   const handleBack = () => {
@@ -114,10 +122,7 @@ const MLScheduleHistory = () => {
                 </tr>
               </thead>
               <tbody className="divide-y divide-primary/5">
-                {currentSchedule.areas?.map((d) => {
-                  const catBadge = STATUS_BADGES[d.wasteCategory] ||
-                    { bg: "bg-gray-100", text: "text-gray-700" };
-                  return (
+                {currentSchedule.areas?.map((d) => (
                     <tr key={d.area} className={d.action === "skip" ? "opacity-50" : ""}>
                       <td className="px-5 py-3 font-medium text-primary">
                         {d.area}
@@ -149,8 +154,7 @@ const MLScheduleHistory = () => {
                         {d.assignedTrucks?.map((t) => t.licensePlate || t.truckId).join(", ") || "—"}
                       </td>
                     </tr>
-                  );
-                })}
+                ))}
               </tbody>
             </table>
           </div>
@@ -176,7 +180,7 @@ const MLScheduleHistory = () => {
         {/* Filter */}
         <select
           value={statusFilter}
-          onChange={(e) => setStatusFilter(e.target.value)}
+          onChange={(e) => handleStatusFilterChange(e.target.value)}
           className="px-4 py-2 rounded-xl border border-primary/15 text-sm
                      focus:outline-none focus:ring-2 focus:ring-accent/30
                      text-primary"
@@ -262,6 +266,11 @@ const MLScheduleHistory = () => {
               </tbody>
             </table>
           </div>
+          <PaginationControls
+            pagination={schedulePagination}
+            onPageChange={setPage}
+            itemLabel="schedules"
+          />
         </div>
       )}
 

@@ -4,9 +4,11 @@ import useAuthStore from "../stores/useAuthStore";
 import useOrganizationStore from "../stores/useOrganizationStore";
 import { UserCog, Users, Building2, Shield, Search, ChevronRight, Mail, Phone, Calendar, X, Eye } from "lucide-react";
 import StatsCard from "../components/dashboard/StatsCard";
+import PaginationControls from "../components/shared/PaginationControls";
+import { AdminEmptyState, AdminErrorState, TableSkeleton } from "../components/shared/AdminListStates";
 
 const Admins = () => {
-  const { admins, orgName, orgGroups, isLoading, error, fetchAdmins, createAdmin, updateAdmin, deleteAdmin } = useAdminStore();
+  const { admins, orgName, orgGroups, pagination, isLoading, error, fetchAdmins, createAdmin, updateAdmin, deleteAdmin } = useAdminStore();
   const user = useAuthStore((s) => s.user);
   const { organizations, fetchOrganizations } = useOrganizationStore();
   const isSuperAdmin = user?.role === "super_admin";
@@ -22,7 +24,7 @@ const Admins = () => {
   const [searchQuery, setSearchQuery] = useState("");
   const [roleFilter, setRoleFilter] = useState("all");
 
-  useEffect(() => { fetchAdmins(); }, [fetchAdmins]);
+  useEffect(() => { fetchAdmins({ page: 1, limit: 10 }); }, [fetchAdmins]);
 
   useEffect(() => {
     if (isSuperAdmin) fetchOrganizations();
@@ -98,7 +100,7 @@ const Admins = () => {
   };
 
   // Derived stats
-  const totalAdmins = admins.length;
+  const totalAdmins = pagination?.total ?? admins.length;
   const orgSet = new Set(admins.map(a => a.organization?.name).filter(Boolean));
   const superAdminCount = admins.filter(a => a.role === "super_admin").length;
   const recentCount = admins.filter(a => {
@@ -197,20 +199,14 @@ const Admins = () => {
 
       {/* Admin List */}
       {isLoading ? (
-        <div className="flex items-center justify-center h-48 bg-white rounded-2xl border border-primary/10">
-          <div className="w-6 h-6 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
-        </div>
+        <TableSkeleton columns={5} rows={7} />
       ) : error ? (
-        <div className="p-6 bg-white rounded-2xl border border-primary/10 text-primary/50 text-center text-sm">
-          Unable to load admins.
-        </div>
+        <AdminErrorState message="Unable to load admins." onRetry={() => fetchAdmins({ page: pagination?.page || 1, limit: 10 })} />
       ) : isSuperAdmin && filteredOrgGroups ? (
         /* Super Admin: Grouped by Organization */
         <div className="space-y-5">
           {filteredOrgGroups.length === 0 ? (
-            <div className="p-8 bg-white rounded-2xl border border-primary/10 text-primary/30 text-center text-sm">
-              {searchQuery || roleFilter !== "all" ? "No admins match your filters." : "No admins found."}
-            </div>
+            <AdminEmptyState icon={UserCog} title={searchQuery || roleFilter !== "all" ? "No admins match your filters" : "No admins found"} message={searchQuery || roleFilter !== "all" ? "Adjust the search or role filter to broaden the result." : "Admin accounts will appear here once they are added."} />
           ) : filteredOrgGroups.map((group) => (
             <div key={group.orgName} className="bg-white rounded-2xl border border-primary/10 overflow-hidden shadow-sm">
               {/* Org header */}
@@ -244,6 +240,11 @@ const Admins = () => {
           <div className="text-xs text-primary/40 text-center">
             Showing {filteredAdmins.length} of {admins.length} admin{admins.length !== 1 ? "s" : ""} across {filteredOrgGroups.length} organization{filteredOrgGroups.length !== 1 ? "s" : ""}
           </div>
+          <PaginationControls
+            pagination={pagination}
+            onPageChange={(nextPage) => fetchAdmins({ page: nextPage, limit: 10 })}
+            itemLabel="admins"
+          />
         </div>
       ) : (
         /* Org Admin: Flat table for own org */
@@ -261,9 +262,11 @@ const Admins = () => {
               </thead>
               <tbody>
                 {filteredAdmins.length === 0 ? (
-                  <tr><td colSpan={5} className="px-6 py-12 text-center text-primary/30 text-sm">
-                    {searchQuery || roleFilter !== "all" ? "No admins match your filters." : "No admins found."}
-                  </td></tr>
+                  <tr>
+                    <td colSpan={5} className="p-0">
+                      <AdminEmptyState icon={UserCog} title={searchQuery || roleFilter !== "all" ? "No admins match your filters" : "No admins found"} message={searchQuery || roleFilter !== "all" ? "Adjust the search or role filter to broaden the result." : "Admin accounts will appear here once they are added."} />
+                    </td>
+                  </tr>
                 ) : filteredAdmins.map(a => (
                   <AdminRow key={a.id} a={a} isSuperAdmin={false} setViewAdmin={setViewAdmin} openEdit={openEdit} setDeleteTarget={setDeleteTarget} setFormError={setFormError} />
                 ))}
@@ -273,6 +276,11 @@ const Admins = () => {
           <div className="px-5 py-3 border-t border-primary/8 bg-primary/2 text-xs text-primary/40">
             Showing {filteredAdmins.length} of {admins.length} admin{admins.length !== 1 ? "s" : ""}
           </div>
+          <PaginationControls
+            pagination={pagination}
+            onPageChange={(nextPage) => fetchAdmins({ page: nextPage, limit: 10 })}
+            itemLabel="admins"
+          />
         </div>
       )}
 
